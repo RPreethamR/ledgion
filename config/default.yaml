@@ -1,0 +1,79 @@
+# Ledgion resolved configuration.
+#
+# Source of truth for every pipeline knob. Override per-machine / per-CI via
+# environment variables (prefix LEDGION_, nested with __) or a local .env,
+# e.g. LEDGION_QDRANT__MODE=memory or LEDGION_RETRIEVAL__TOP_K=10.
+# See ledgion/config.py for the loader and precedence rules.
+
+paths:
+  data_dir: data
+  pdf_dir: data/pdfs
+  financebench_dir: data/financebench
+  results_dir: results
+
+torch:
+  # Physical cores only (i5-9300H has 4). Hyperthreading hurts this workload.
+  num_threads: 4
+
+embedding:
+  model_id: BAAI/bge-base-en-v1.5
+  revision: null            # TODO: pin to a commit SHA before the first eval run
+  device: cpu
+  batch_size: 32
+  normalize: true
+  max_seq_length: 512
+
+reranker:
+  model_id: cross-encoder/ms-marco-MiniLM-L-6-v2
+  revision: null            # TODO: pin to a commit SHA before the first eval run
+  device: cpu
+  top_n: 5                  # rerank_top_n
+
+sparse:
+  backend: rank_bm25        # rank_bm25 first, then fastembed into Qdrant
+  fastembed_model: Qdrant/bm25
+
+chunk:
+  size: 512
+  overlap: 64
+  unit: tokens
+  respect_page_boundary: true   # chunks never span a page boundary
+
+retrieval:
+  top_k: 20                 # candidates pulled before rerank
+
+fusion:
+  method: rrf               # rrf | weighted
+  rrf_k: 60
+  dense_weight: 1.0
+  sparse_weight: 1.0
+
+qdrant:
+  mode: docker              # docker (dev) | memory (CI, in-process)
+  url: http://localhost:6333
+  path: qdrant_storage
+  collection_name: ledgion_filings
+  prefer_grpc: false
+
+generation:
+  provider: gemini
+  model: gemini-2.0-flash
+  temperature: 0.0          # deterministic; never a local model in serving
+  max_output_tokens: 1024
+  api_key_env: GEMINI_API_KEY
+
+tracing:
+  enabled: false
+  provider: langfuse
+  host: https://cloud.langfuse.com
+  public_key_env: LANGFUSE_PUBLIC_KEY
+  secret_key_env: LANGFUSE_SECRET_KEY
+
+eval:
+  tier: 1                   # Tier 1 = deterministic, fully offline
+  ragas_enabled: false      # Tier 2 (judged) only
+  judge_model: gemini-2.0-flash
+  metrics:
+    - recall@k
+    - mrr
+    - hit@1
