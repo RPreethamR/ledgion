@@ -15,3 +15,15 @@ Decisions:
 
 Open: table quality unverified on AMD/PepsiCo. If numeric
 questions underperform prose ones, suspect extraction first.
+
+## Phase 1 — golden set
+30 questions across 5 filings. Ground truth from FinanceBench's
+evidence_page_num via to_one_based(); verification 30/30 AGREE,
+mean partial_ratio 96.7. Boeing id_01290 scores 61.8 — evidence
+joins 3 pages, best match still on the labelled page.
+
+answer_type classified on what the question requires, not the
+answer's surface form. Initial heuristic gave 2/28 , numeric/prose; corrected
+to 16/14 by reclassification and by hand.
+
+Selected set derived from PDFs on disk, not a manifest file.
