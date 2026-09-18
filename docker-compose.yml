@@ -1,0 +1,25 @@
+# Qdrant for local development. CI uses the in-process client instead
+# (LEDGION_QDRANT__MODE=memory), so this compose file is dev-only.
+#
+#   docker compose up -d      # start; index persists across restarts
+#   docker compose down       # stop, keep data (named volume survives)
+#   docker compose down -v     # stop and delete the index volume
+#
+# The server version is pinned to match qdrant-client (see pyproject.toml) so the
+# storage format and API never drift under us — same reproducibility rule as the
+# model revision pins.
+services:
+  qdrant:
+    image: qdrant/qdrant:v1.19.1
+    container_name: ledgion-qdrant
+    ports:
+      - "6333:6333"   # REST + dashboard (http://localhost:6333/dashboard)
+      - "6334:6334"   # gRPC
+    volumes:
+      # Named volume, NOT a bind mount: the index survives `down`/restarts and
+      # stays off the disk-tight project tree until explicitly removed with -v.
+      - qdrant_data:/qdrant/storage
+    restart: unless-stopped
+
+volumes:
+  qdrant_data:

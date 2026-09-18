@@ -7,6 +7,7 @@ if sys.platform == "win32":
     sys.stderr.reconfigure(encoding="utf-8")
 
 import json
+import logging
 from pathlib import Path
 
 import typer
@@ -26,10 +27,20 @@ def _show_config(config_path: Path | None) -> None:
 
 
 @app.command()
-def ingest(config: Path | None = _ConfigOption) -> None:
-    """Parse, chunk, and embed filings into the vector store. [stub]"""
-    _show_config(config)
-    typer.echo("ingest: not implemented in Phase 0.")
+def ingest(
+    config: Path | None = _ConfigOption,
+    force: bool = typer.Option(
+        False, "--force", help="Bypass the embedding cache and recompute every vector."
+    ),
+) -> None:
+    """Parse, chunk, and embed filings into the vector store."""
+    # INFO-level so the embedder's truncation tripwire (a warning) is visible.
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+    cfg = load_config(config)
+    # Imported lazily: keeps the torch/qdrant stack out of `ask`/`eval` startup.
+    from ledgion.ingest.pipeline import run
+
+    run(cfg, force=force)
 
 
 @app.command()

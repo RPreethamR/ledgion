@@ -27,3 +27,17 @@ answer's surface form. Initial heuristic gave 2/28 , numeric/prose; corrected
 to 16/14 by reclassification and by hand.
 
 Selected set derived from PDFs on disk, not a manifest file.
+
+## Phase 2 — ingestion
+2181 chunks / 1230 pages across 5 filings (1.77 chunks/page).
+Cold run 16.7 min, warm 41s with 2181/2181 cache hits.
+Qdrant volume 22 MiB, embedding cache 6.6 MiB.
+
+Token-length recursive splitter, size=448 (headroom below bge's
+512 max; truncation tripwire never fired). Named dense vector
+(768-d, cosine) so Phase 6 sparse needs no migration.
+Ticker from hand-maintained config map; unmapped company is a
+hard error. Indexed filterable alongside doc_id/page_num.
+Cache key = sha256(revision + text) — 2178 files for 2181 chunks,
+3 boilerplate duplicates dedup correctly.
+Qdrant pinned v1.19.1 to match client 1.19.0.

@@ -48,6 +48,8 @@ class PathsConfig(BaseModel):
     pdf_dir: Path = Path("data/pdfs")
     financebench_dir: Path = Path("data/financebench")
     results_dir: Path = Path("results")
+    # Embedding cache lives under here (<cache_dir>/embeddings); gitignored.
+    cache_dir: Path = Path(".cache")
 
 
 class TorchConfig(BaseModel):
@@ -58,18 +60,25 @@ class TorchConfig(BaseModel):
 
 class EmbeddingConfig(BaseModel):
     model_id: str = "BAAI/bge-base-en-v1.5"
-    # TODO: pin to a commit SHA before the first real eval run (CLAUDE.md
-    # requires revision pinning; left null in scaffold to avoid a fabricated SHA).
-    revision: str | None = None
+    # Pinned commit SHA (CLAUDE.md requires revision pinning). config/default.yaml
+    # is the source of truth; this default mirrors it so a bare Settings() is valid.
+    # The loader passes it to SentenceTransformer(revision=...) AND folds it into
+    # the embedding cache key, so a model change can never silently reuse old vectors.
+    revision: str | None = "a5beb1e3e68b9ab74eb54cfd186867f64f240e1a"
     device: str = "cpu"
     batch_size: int = 32
     normalize: bool = True
     max_seq_length: int = 512
+    # bge asks *queries* (not documents) to carry this instruction for retrieval.
+    # Kept in config so "instruction vs none" stays a measurable ablation.
+    query_instruction: str = "Represent this sentence for searching relevant passages:"
 
 
 class RerankerConfig(BaseModel):
     model_id: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
-    revision: str | None = None  # TODO: pin to a commit SHA (see EmbeddingConfig)
+    # Pinned commit SHA (see EmbeddingConfig). Wired into CrossEncoder(revision=...)
+    # when the reranker lands in Phase 3; pinned now so config is stable meanwhile.
+    revision: str | None = "233902d25c440f23af6f7d6e94d2946bac0bee0a"
     device: str = "cpu"
     top_n: int = 5  # rerank_top_n: how many survive reranking
 
@@ -81,7 +90,9 @@ class SparseConfig(BaseModel):
 
 
 class ChunkConfig(BaseModel):
-    size: int = 512
+    # 448 not 512: deliberate headroom below bge's 512-token window (2 special
+    # tokens + margin) so a full chunk is never silently truncated at embed time.
+    size: int = 448
     overlap: int = 64
     unit: Literal["tokens", "chars"] = "tokens"
     # Hard rule from CLAUDE.md: chunks never span a page boundary.
@@ -146,6 +157,12 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore",
     )
+
+    # Hand-maintained company -> ticker map. FinanceBench ships no ticker field,
+    # so ticker provenance lives in config (keyed by the FinanceBench `company`
+    # name) rather than being parsed from filenames. config/default.yaml is the
+    # source of truth; an unmapped company raises at ingest, never a blank ticker.
+    tickers: dict[str, str] = Field(default_factory=dict)
 
     paths: PathsConfig = Field(default_factory=PathsConfig)
     torch: TorchConfig = Field(default_factory=TorchConfig)
