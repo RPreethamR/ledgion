@@ -1,5 +1,8 @@
-"""Config loading + hashing. The hash keys every results/<hash>.json file,
-so it must be deterministic and independent of dict/field ordering."""
+"""Config loading + hashing. The hash keys every results/<hash>.json file, so it
+must be deterministic, independent of dict/field ordering, AND independent of the
+host path separator (so a Windows dev run and a Linux CI run agree)."""
+
+from pathlib import PurePosixPath, PureWindowsPath
 
 from ledgion.config import Settings, config_hash, load_config
 
@@ -20,8 +23,11 @@ def test_config_loads_from_default_yaml():
 
 
 def test_config_hash_is_stable():
-    fixed = {"b": 2, "a": 1, "nested": {"y": [3, 2, 1], "x": "v"}}
-    reordered = {"nested": {"x": "v", "y": [3, 2, 1]}, "a": 1, "b": 2}
+    # A Path is included so the pin guards the POSIX normalisation too, not just
+    # the key-sorted JSON canonicalisation.
+    win_path = PureWindowsPath("data\\pdfs")
+    fixed = {"b": 2, "a": 1, "nested": {"y": [3, 2, 1], "x": "v"}, "root": win_path}
+    reordered = {"root": win_path, "nested": {"x": "v", "y": [3, 2, 1]}, "a": 1, "b": 2}
 
     h = config_hash(fixed)
 
@@ -30,4 +36,15 @@ def test_config_hash_is_stable():
     assert len(h) == 64  # sha-256 hex digest
     # Pinned so a change to the canonicalisation (which would silently rename
     # every results file) breaks this test loudly.
-    assert h == "fdd0976613714aa44286d75569778b224607dc49e783a20d36d499701b024c01"
+    assert h == "2c669b44d465d79579ae0e9969c0f150f03d0aece1e8abee87c9e8875c864b78"
+
+
+def test_config_hash_is_path_separator_independent():
+    # The same config expressed with Windows vs POSIX separators must hash the
+    # same (the normaliser recurses into nested dicts), so results/<hash>.json
+    # lines up across a Windows dev run and a Linux CI run.
+    win = {"paths": {"pdf_dir": PureWindowsPath("data\\pdfs")}}
+    posix = {"paths": {"pdf_dir": PurePosixPath("data/pdfs")}}
+    assert config_hash(win) == config_hash(posix)
+    # Normalisation only rewrites separators — genuinely different paths still differ.
+    assert config_hash(win) != config_hash({"paths": {"pdf_dir": PurePosixPath("data/other")}})

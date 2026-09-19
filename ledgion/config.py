@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Any, ClassVar, Literal
 
 from pydantic import BaseModel, Field
@@ -224,16 +224,41 @@ def load_config(path: str | Path | None = None) -> Settings:
     return Settings()
 
 
+def _posix_paths(value: Any) -> Any:
+    """Recursively rewrite every ``PurePath`` to its POSIX (forward-slash) string.
+
+    Pydantic serialises a ``Path`` with the *host* separator — ``data\\pdfs`` on
+    Windows, ``data/pdfs`` on Linux — so the identical config would otherwise hash
+    differently on the dev machine and the CI runner, splitting
+    ``results/<hash>.json`` and defeating ``--compare``. This normalises paths to
+    forward slashes *for hashing only*: it runs on a throwaway copy built solely to
+    compute the digest and does not change how paths are stored or used anywhere
+    else.
+    """
+    if isinstance(value, PurePath):
+        return value.as_posix()
+    if isinstance(value, dict):
+        return {key: _posix_paths(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_posix_paths(item) for item in value]
+    return value
+
+
 def config_hash(config: Settings | BaseModel | dict[str, Any]) -> str:
     """Return a stable SHA-256 hex digest for a config.
 
     Keys are sorted and the JSON is emitted canonically, so the digest depends
-    only on the values, not on dict/field ordering. This is the key eval runs
-    use for ``results/<hash>.json``.
+    only on the values, not on dict/field ordering. ``Path`` fields are normalised
+    to POSIX separators first (see ``_posix_paths``), so the *same* config hashes
+    identically on Windows and Linux. This is the key eval runs use for
+    ``results/<hash>.json``.
     """
     if isinstance(config, BaseModel):
-        data: Any = config.model_dump(mode="json")
+        # Python-mode dump (not mode="json") keeps Path fields as Path objects, so
+        # _posix_paths can normalise their separators before they become strings.
+        data: Any = config.model_dump()
     else:
         data = config
+    data = _posix_paths(data)
     canonical = json.dumps(data, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()

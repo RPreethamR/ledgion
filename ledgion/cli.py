@@ -6,24 +6,23 @@ if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stderr.reconfigure(encoding="utf-8")
 
-import json
 import logging
 from pathlib import Path
 
 import typer
 
-from ledgion.config import config_hash, load_config
+from ledgion.config import load_config
 
 app = typer.Typer(add_completion=False, help="Ledgion — RAG QA over SEC filings.")
 
 _ConfigOption = typer.Option(None, "--config", "-c", help="Path to a config YAML.")
-
-
-def _show_config(config_path: Path | None) -> None:
-    """Resolve config and print it plus its hash (the results/<hash>.json key)."""
-    cfg = load_config(config_path)
-    typer.echo(json.dumps(cfg.model_dump(mode="json"), indent=2, default=str))
-    typer.echo(f"config_hash: {config_hash(cfg)}")
+# Module-level singletons (per the B008 convention) for the eval-specific options.
+_TierOption = typer.Option(
+    1, "--tier", "-t", min=1, max=2, help="1 = offline retrieval, 2 = judged."
+)
+_CompareOption = typer.Option(
+    None, "--compare", help="A previous results/<hash>.json to print a delta table against."
+)
 
 
 @app.command()
@@ -87,11 +86,50 @@ def ask(
         )
 
 
+def _print_eval_summary(report: dict) -> None:
+    """Print the metric table (overall + per answer type) for one results file."""
+    metrics = report["metrics"]
+    counts = metrics.get("counts", {})
+    dirty = "  (dirty)" if report.get("git_dirty") else ""
+    typer.echo(
+        f"Tier {report['tier']}  ·  config {report['config_hash'][:12]}  ·  "
+        f"git {report['git_sha'][:12]}{dirty}"
+    )
+    specs = list(metrics["overall"].keys())
+    typer.echo(f"{'group':<8} " + " ".join(f"{s:>10}" for s in specs) + f"  {'n':>4}")
+    for group in ("overall", "numeric", "prose"):
+        if group not in metrics:
+            continue
+        cells = " ".join(f"{metrics[group][s]:>10.4f}" for s in specs)
+        typer.echo(f"{group:<8} {cells}  {counts.get(group, 0):>4}")
+
+    tier2 = report.get("tier2")
+    if tier2 and tier2.get("metrics"):
+        judged = " ".join(f"{k}={v:.4f}" for k, v in sorted(tier2["metrics"].items()))
+        typer.echo(f"tier2    {judged}")
+
+
 @app.command("eval")
-def run_eval(config: Path | None = _ConfigOption) -> None:
-    """Run the offline eval and write results/<hash>.json. [stub]"""
-    _show_config(config)
-    typer.echo("eval: not implemented in Phase 0.")
+def run_eval(
+    config: Path | None = _ConfigOption,
+    tier: int = _TierOption,
+    compare: Path | None = _CompareOption,
+) -> None:
+    """Run the offline eval, write results/<hash>.json, and print a summary."""
+    logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
+    cfg = load_config(config)
+    # Lazily imported so `--help` doesn't pull in torch/qdrant.
+    from ledgion.eval import runner
+
+    path = runner.run(cfg, tier=tier)
+    report = runner.load_report(path)
+    _print_eval_summary(report)
+    typer.echo(f"\nwrote {path}")
+
+    if compare is not None:
+        old = runner.load_report(compare)
+        typer.echo("")
+        typer.echo(runner.format_compare(old, report))
 
 
 def main() -> None:
