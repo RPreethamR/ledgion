@@ -117,6 +117,38 @@ def test_tier1_runs_offline_and_reports_by_answer_type():
     assert by_qid["q_prose"]["evidence_pages"] == [5]
 
 
+def test_recall_at_10_and_recall_at_k_are_distinct_columns():
+    # Relevant page 52 is retrieved at rank 11 (positions 0..10). recall@k spans
+    # the full candidate depth (top_k=20) and finds it; recall@10's fixed cutoff
+    # does not — proving the two recall columns are genuinely distinct, both from
+    # the single recall_at_k function at different k.
+    golden = [
+        {
+            "qid": "q",
+            "doc_id": "AMCOR_2023_10K",
+            "question": "q?",
+            "answer_type": "numeric",
+            "evidence_pages": [52],
+        },
+    ]
+    pages = list(range(1, 11)) + [52]  # 10 non-relevant pages, then page 52 at rank 11
+    retriever = _FakeRetriever({"q?": pages})
+
+    result = run_tier1(
+        golden,
+        retriever,
+        top_k=20,
+        metric_specs=["recall@k", "recall@10"],
+        default_k=20,
+    )
+
+    per_q = result["results"][0]["metrics"]
+    assert per_q["recall@k"] == 1.0  # found within the full top_k (=20)
+    assert per_q["recall@10"] == 0.0  # but not within the fixed top 10
+    # both are reported as their own aggregate columns.
+    assert set(result["metrics"]["overall"]) == {"recall@k", "recall@10"}
+
+
 def test_tier1_two_runs_are_identical():
     # Same config (same golden, same fake retriever) -> identical numbers, every
     # metric, every per-question record. This is the determinism guarantee that

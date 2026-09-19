@@ -94,7 +94,8 @@ eval:
   ragas_enabled: false      # Tier 2 (judged) only
   judge_model: gemini-2.0-flash
   metrics:
-    - recall@k
+    - recall@k                # recall at the full candidate depth (retrieval.top_k)
+    - recall@10               # same recall_at_k function, fixed cutoff of 10
     - ndcg@10
     - mrr
     - hit@1

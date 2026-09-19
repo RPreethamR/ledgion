@@ -93,6 +93,7 @@ eval:
   judge_model: gemini-2.0-flash
   metrics:
     - recall@k
+    - recall@10
     - ndcg@10
     - mrr
     - hit@1
