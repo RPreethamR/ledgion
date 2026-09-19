@@ -74,10 +74,13 @@ qdrant:
 
 generation:
   provider: gemini
-  model: gemini-2.0-flash
+  model: gemini-3.8-flash
   temperature: 0.0          # deterministic; never a local model in serving
-  max_output_tokens: 1024
+  max_output_tokens: 2048
   api_key_env: GEMINI_API_KEY
+  thinking_budget: 0        # 0 disables thinking; it otherwise eats max_output_tokens
+  max_retries: 5            # retry transient 429/5xx (e.g. model overloaded)
+  retry_base_delay_s: 2.0   # backoff before attempt n = retry_base_delay_s * 2**n
 
 tracing:
   enabled: false

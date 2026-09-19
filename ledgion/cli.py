@@ -45,12 +45,46 @@ def ingest(
 
 @app.command()
 def ask(
-    question: str | None = typer.Argument(None, help="Question to answer."),
+    question: str = typer.Argument(..., help="Question to answer."),
     config: Path | None = _ConfigOption,
 ) -> None:
-    """Answer a question with page-level citations. [stub]"""
-    _show_config(config)
-    typer.echo("ask: not implemented in Phase 0.")
+    """Answer a question from the filings with validated page-level citations."""
+    # WARNING keeps the embedder's truncation tripwire visible without the INFO
+    # chatter of model loading drowning the answer.
+    logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
+    cfg = load_config(config)
+    # Lazily imported so `--help` and other commands don't pull in torch/qdrant.
+    from ledgion.generate.gemini import GeminiGenerator
+    from ledgion.retrieve.dense import DenseRetriever
+
+    retriever = DenseRetriever.from_config(cfg)
+    contexts = retriever.retrieve(question, top_k=cfg.retrieval.top_k)
+    generator = GeminiGenerator.from_config(cfg)
+    try:
+        answer = generator.generate(question, contexts)
+    except RuntimeError as exc:
+        # e.g. a missing API key — a one-line message, not a stack trace. (A cached
+        # answer needs no key, so this only fires on a genuine cache-miss call.)
+        typer.secho(str(exc), fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(answer.text)
+    typer.echo("")
+    if answer.insufficient_evidence:
+        typer.echo("[insufficient evidence: the model reported the filings don't answer this]")
+
+    if answer.citations:
+        typer.echo(f"Citations ({len(answer.citations)}, validity {answer.citation_validity:.2f}):")
+        for doc_id, page_num in answer.citations:
+            typer.echo(f"  - {doc_id}  p.{page_num}")
+    else:
+        typer.echo("Citations: none")
+
+    if answer.dropped_citations:
+        typer.echo(
+            f"Dropped {len(answer.dropped_citations)} fabricated citation(s) "
+            f"not in context: {', '.join(answer.dropped_citations)}"
+        )
 
 
 @app.command("eval")

@@ -41,3 +41,15 @@ hard error. Indexed filterable alongside doc_id/page_num.
 Cache key = sha256(revision + text) — 2178 files for 2181 chunks,
 3 boilerplate duplicates dedup correctly.
 Qdrant pinned v1.19.1 to match client 1.19.0.
+
+## Phase 3 — baseline pipeline
+Dense-only retrieval + gemini-3.8-flash generation, temp=0.
+Citations validated server-side against the context sent.
+Refusal path verified — out-of-corpus question returns
+insufficient_evidence with no citations.
+
+gemini-3.8-flash is a thinking model; reasoning tokens count
+against max_output_tokens. For example, 979 of 1024 went to thinking, leaving 31 for the answer → truncated JSON → poisoned cache.
+Fixed: thinking_budget knob (default 0), max_output_tokens 2048,
+MAX_TOKENS guard raises instead of caching a truncated response,
+cache treats unparseable JSON as a miss.

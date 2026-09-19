@@ -20,7 +20,7 @@ This module is contracts only — no implementations.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
 # A dense embedding and a matrix of them. Typed as plain float sequences so the
@@ -65,12 +65,25 @@ class RetrievedChunk:
 
 @dataclass(frozen=True, slots=True)
 class Answer:
-    """A generated answer with the page-level provenance it was grounded on."""
+    """A generated answer with the page-level provenance it was grounded on.
+
+    ``citations`` holds only *validated* provenance: (doc_id, page_num) pairs for
+    chunk_ids the model cited that were actually in the context sent to it (see
+    generate/citations.py). ``insufficient_evidence`` is the model's own signal
+    that the context did not contain the answer. ``citation_validity`` and
+    ``dropped_citations`` are the deterministic, judge-free faithfulness signal:
+    the fraction of cited chunk_ids that were real, and the fabricated ids that
+    were discarded. The last three are defaulted so a caller that skips citation
+    validation still builds a valid ``Answer``.
+    """
 
     question: str
     text: str
-    citations: list[tuple[str, int]]  # (doc_id, page_num), page-level provenance
+    citations: list[tuple[str, int]]  # validated (doc_id, page_num) provenance
     contexts: list[RetrievedChunk]
+    insufficient_evidence: bool = False
+    citation_validity: float = 1.0
+    dropped_citations: list[str] = field(default_factory=list)
 
 
 @runtime_checkable

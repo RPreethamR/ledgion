@@ -123,8 +123,20 @@ class GenerationConfig(BaseModel):
     provider: Literal["gemini"] = "gemini"
     model: str = "gemini-2.0-flash"
     temperature: float = 0.0  # deterministic; never a local model in the serving path
-    max_output_tokens: int = 1024
+    max_output_tokens: int = 2048
     api_key_env: str = "GEMINI_API_KEY"  # name of the env var holding the secret
+    # Gemini "thinking" budget in tokens. Thinking tokens COUNT AGAINST
+    # max_output_tokens, so leaving it on can starve the actual answer and
+    # truncate the JSON mid-string. 0 disables thinking (right for this
+    # deterministic, temperature-0 extraction task); -1 lets the model choose;
+    # a positive int caps it; None omits the field entirely (model default).
+    thinking_budget: int | None = 0
+    # Bounded retry with exponential backoff for *transient* API failures (HTTP
+    # 429/5xx, e.g. "model overloaded"). Delay before attempt n is
+    # retry_base_delay_s * 2**n. Non-transient errors (bad key, unknown model)
+    # fail immediately — retrying them only delays the inevitable.
+    max_retries: int = 5
+    retry_base_delay_s: float = 2.0
 
 
 class TracingConfig(BaseModel):
@@ -197,6 +209,17 @@ def load_config(path: str | Path | None = None) -> Settings:
     ``path`` overrides which YAML file is read (defaults to
     ``config/default.yaml``); environment and ``.env`` still layer on top.
     """
+    # Load the repo-root ``.env`` into the process environment. pydantic reads
+    # ``.env`` only to fill LEDGION_-prefixed *model* fields; secrets named
+    # indirectly (``generation.api_key_env`` -> GEMINI_API_KEY, read via
+    # ``os.environ``) would otherwise never see it. ``override=False`` keeps a real
+    # environment variable ahead of ``.env``, matching the env > .env precedence
+    # used for the model fields. Path is resolved from the repo root, not the CWD,
+    # so it's found regardless of where the command is run.
+    from dotenv import load_dotenv
+
+    load_dotenv(REPO_ROOT / ".env", override=False)
+
     Settings.yaml_path = Path(path) if path is not None else DEFAULT_CONFIG_PATH
     return Settings()
 
