@@ -53,3 +53,22 @@ against max_output_tokens. For example, 979 of 1024 went to thinking, leaving 31
 Fixed: thinking_budget knob (default 0), max_output_tokens 2048,
 MAX_TOKENS guard raises instead of caching a truncated response,
 cache treats unparseable JSON as a miss.
+
+## Phase 4 — eval harness + baseline
+Tier 1 offline, retriever injected. 48 tests green.
+Config hash normalises Paths via as_posix() — was platform-
+dependent, would have broken the CI delta gate.
+
+BASELINE (dense-only, 30 questions, config 4af90eda0d31):
+  overall  hit@1 .133  mrr .263  ndcg@10 .300  r@10 .500  r@50 .817
+  numeric  hit@1 .188  mrr .305  ndcg@10 .330  r@10 .531  r@50 .938
+  prose    hit@1 .071  mrr .216  ndcg@10 .265  r@10 .464  r@50 .679
+
+Read: large r@10/r@50 gap (.50 vs .82) — evidence is retrieved
+but buried. Ranking problem, not a finding problem. Cross-encoder
+has ~32pp of headroom. Prose r@50 .679 is the hard floor —
+~4-5 questions never surface evidence at all; reranking can't
+reach those, Phase 6 might.
+
+Ragas deferred (500MB LangChain+datasets). Faithfulness via
+deterministic citation_validity instead.

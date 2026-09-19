@@ -1,10 +1,10 @@
 import pytest
 
 from ledgion.eval.metrics import (
-    recall_at_k,
     hit_at_1,
     mrr,
     ndcg_at_k,
+    recall_at_k,
 )
 
 

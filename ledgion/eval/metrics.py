@@ -7,7 +7,6 @@ def recall_at_k(ranked: list[int], relevant: set[int], k: int) -> float:
         raise ValueError("relevant must not be empty")
     if k <= 0:
         raise ValueError("k must be greater than 0")
-    
     retrieved_relevant = sum(
         1 for page in ranked[:k] if page in relevant
     )
