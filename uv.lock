@@ -490,13 +490,13 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "google-genai" },
+    { name = "numpy" },
     { name = "pydantic-settings" },
     { name = "pymupdf" },
     { name = "python-dotenv" },
     { name = "pyyaml" },
     { name = "qdrant-client" },
     { name = "rapidfuzz" },
-    { name = "sentence-transformers" },
     { name = "typer" },
 ]
 
@@ -505,17 +505,20 @@ dev = [
     { name = "pytest" },
     { name = "ruff" },
 ]
+models = [
+    { name = "sentence-transformers" },
+]
 
 [package.metadata]
 requires-dist = [
     { name = "google-genai", specifier = ">=2.24.0" },
+    { name = "numpy", specifier = ">=2.0" },
     { name = "pydantic-settings", specifier = ">=2.15.0" },
     { name = "pymupdf", specifier = ">=1.28.2" },
     { name = "python-dotenv", specifier = ">=1.2.3" },
     { name = "pyyaml", specifier = ">=6.0.3" },
     { name = "qdrant-client", specifier = ">=1.19.0" },
     { name = "rapidfuzz", specifier = ">=3.14.6" },
-    { name = "sentence-transformers", specifier = ">=6.0.1" },
     { name = "typer", specifier = ">=0.27.2" },
 ]
 
@@ -524,6 +527,7 @@ dev = [
     { name = "pytest", specifier = ">=9.1.1" },
     { name = "ruff", specifier = ">=0.16.7" },
 ]
+models = [{ name = "sentence-transformers", specifier = ">=6.0.1" }]
 
 [[package]]
 name = "markdown-it-py"

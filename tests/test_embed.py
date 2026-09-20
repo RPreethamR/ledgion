@@ -15,14 +15,20 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-from huggingface_hub import try_to_load_from_cache
 
 from ledgion.config import load_config
 from ledgion.ingest.embed import BGEEmbedder, cache_key
 
 
 def _model_cached(model_id: str, revision: str | None) -> bool:
-    """True iff the model weights are already in the local HF cache (no network)."""
+    """True iff the model weights are already in the local HF cache (no network).
+
+    huggingface_hub ships with the (torch-heavy) ``models`` dependency group, which
+    CI omits — so it is imported lazily, inside the one test that needs it, rather
+    than at module top where its absence would break collection instead of skipping.
+    """
+    from huggingface_hub import try_to_load_from_cache
+
     path = try_to_load_from_cache(model_id, "model.safetensors", revision=revision)
     return isinstance(path, str)
 
@@ -59,6 +65,7 @@ def test_shipped_config_pins_revisions():
 
 
 def test_cache_returns_identical_vectors_on_second_call(tmp_path):
+    pytest.importorskip("huggingface_hub")  # skip cleanly on the torch-free CI env
     cfg = load_config()
     if not _model_cached(cfg.embedding.model_id, cfg.embedding.revision):
         pytest.skip("bge-base not in local HF cache; skipping to stay offline")

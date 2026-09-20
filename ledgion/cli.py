@@ -23,6 +23,12 @@ _TierOption = typer.Option(
 _CompareOption = typer.Option(
     None, "--compare", help="A previous results/<hash>.json to print a delta table against."
 )
+_GateOption = typer.Option(
+    False,
+    "--gate",
+    help="Fail (exit non-zero) if a gated metric falls more than eval.gate_tolerance "
+    "below fixtures/baseline_metrics.json. Improvements always pass.",
+)
 
 
 @app.command()
@@ -114,6 +120,7 @@ def run_eval(
     config: Path | None = _ConfigOption,
     tier: int = _TierOption,
     compare: Path | None = _CompareOption,
+    gate: bool = _GateOption,
 ) -> None:
     """Run the offline eval, write results/<hash>.json, and print a summary."""
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
@@ -130,6 +137,47 @@ def run_eval(
         old = runner.load_report(compare)
         typer.echo("")
         typer.echo(runner.format_compare(old, report))
+
+    if gate:
+        from ledgion.eval.gate import check_gate, load_baseline
+
+        try:
+            result = check_gate(
+                report["metrics"]["overall"],
+                load_baseline(),
+                gated_metrics=cfg.eval.gate_metrics,
+                tolerance=cfg.eval.gate_tolerance,
+            )
+        except KeyError as exc:
+            typer.secho(str(exc), fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=1) from exc
+        typer.echo("")
+        typer.echo(result.message())
+        if not result.ok:
+            raise typer.Exit(code=1)
+
+
+@app.command()
+def fixture(config: Path | None = _ConfigOption) -> None:
+    """Regenerate the offline Tier-1 fixtures from the live local setup.
+
+    Reads the populated Qdrant + the bge model and writes fixtures/index.npz,
+    query_vectors.npz, and manifest.json — the artifacts the CI gate replays with
+    no model or network. Run this whenever the corpus, the golden set, or the
+    embedding revision changes.
+    """
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+    cfg = load_config(config)
+    # Lazily imported so `--help` and other commands don't pull in torch/qdrant.
+    from ledgion.eval.fixtures import generate_fixtures
+
+    summary = generate_fixtures(cfg)
+    typer.echo(
+        f"wrote {summary['chunk_count']} chunk vectors, "
+        f"{summary['query_count']} query vectors"
+    )
+    for key in ("index", "query_vectors", "manifest"):
+        typer.echo(f"  {summary[key]}")
 
 
 def main() -> None:

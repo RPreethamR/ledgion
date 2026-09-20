@@ -1,0 +1,41 @@
+{
+  "chunk_count": 2181,
+  "embedding": {
+    "model_id": "BAAI/bge-base-en-v1.5",
+    "revision": "a5beb1e3e68b9ab74eb54cfd186867f64f240e1a"
+  },
+  "generated_at": "2026-09-20T22:59:54+00:00",
+  "golden_qids": [
+    "financebench_id_00222",
+    "financebench_id_00464",
+    "financebench_id_00476",
+    "financebench_id_00494",
+    "financebench_id_00517",
+    "financebench_id_00563",
+    "financebench_id_00585",
+    "financebench_id_00678",
+    "financebench_id_00684",
+    "financebench_id_00720",
+    "financebench_id_00723",
+    "financebench_id_00735",
+    "financebench_id_00757",
+    "financebench_id_00799",
+    "financebench_id_00917",
+    "financebench_id_00995",
+    "financebench_id_01009",
+    "financebench_id_01028",
+    "financebench_id_01079",
+    "financebench_id_01091",
+    "financebench_id_01148",
+    "financebench_id_01198",
+    "financebench_id_01279",
+    "financebench_id_01290",
+    "financebench_id_01328",
+    "financebench_id_01351",
+    "financebench_id_01964",
+    "financebench_id_01981",
+    "financebench_id_03620",
+    "financebench_id_04481"
+  ],
+  "source_git_sha": "d845388e845b6c28f5eeab345aeb27464925c260"
+}

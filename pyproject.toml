@@ -4,15 +4,20 @@ version = "0.1.0"
 description = "Retrieval-augmented QA over SEC filings, benchmarked on FinanceBench, with page-level citations."
 readme = "README.md"
 requires-python = ">=3.11,<3.12"
+# Core, always-installed deps. Deliberately torch-free: config, the CLI, the
+# in-process Qdrant client, and numpy are all the offline Tier-1 path (and the CI
+# gate) needs. The heavy embedding/reranking stack lives in the `models`
+# dependency-group below, so `uv sync --no-group models` yields a runner that
+# scores retrieval against committed fixtures without downloading a single model.
 dependencies = [
     "google-genai>=2.24.0",
+    "numpy>=2.0",
     "pydantic-settings>=2.15.0",
     "pymupdf>=1.28.2",
     "python-dotenv>=1.2.3",
     "pyyaml>=6.0.3",
     "qdrant-client>=1.19.0",
     "rapidfuzz>=3.14.6",
-    "sentence-transformers>=6.0.1",
     "typer>=0.27.2",
 ]
 
@@ -25,6 +30,13 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["ledgion"]
+
+[tool.uv]
+# `models` is heavy but part of the everyday local workflow (ingest, live
+# retrieval, fixture generation), so install it by default. CI is the only
+# consumer that opts out, with `uv sync --no-group models`, keeping torch and
+# sentence-transformers off the runner entirely.
+default-groups = ["dev", "models"]
 
 # CPU-only torch. The default PyPI wheel bundles CUDA (multi-GB) on Windows;
 # pinning the torch source to PyTorch's cpu index keeps it small and makes even
@@ -56,4 +68,11 @@ addopts = "-q"
 dev = [
     "pytest>=9.1.1",
     "ruff>=0.16.7",
+]
+# The heavy embedding/reranking stack. sentence-transformers pulls torch (+
+# transformers, huggingface_hub, tokenizers, safetensors) — multiple GB. Kept in
+# its own group, NOT in [project.dependencies], so the offline Tier-1 gate can
+# install a torch-free environment on any runner: `uv sync --no-group models`.
+models = [
+    "sentence-transformers>=6.0.1",
 ]

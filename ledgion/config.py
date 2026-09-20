@@ -101,6 +101,12 @@ class ChunkConfig(BaseModel):
 
 class RetrievalConfig(BaseModel):
     top_k: int = 20  # candidates pulled before rerank
+    # Which Retriever the eval harness builds. "dense" is the real, model-backed
+    # path (bge + a populated Qdrant); "fixture" is the offline CI path that reads
+    # committed fixtures/*.npz into an in-process Qdrant and never loads a model.
+    # Config-driven (not a CLI flag) so `ledgion eval --tier 1 --gate` runs the
+    # offline path in CI purely via LEDGION_RETRIEVAL__BACKEND=fixture.
+    backend: Literal["dense", "fixture"] = "dense"
 
 
 class FusionConfig(BaseModel):
@@ -153,6 +159,12 @@ class EvalConfig(BaseModel):
     ragas_enabled: bool = False  # Tier 2 (judged) only
     judge_model: str = "gemini-2.0-flash"
     metrics: list[str] = Field(default_factory=lambda: ["recall@k", "mrr", "hit@1"])
+    # The CI gate (ledgion eval --gate). It fails the build only if one of
+    # gate_metrics falls more than gate_tolerance below fixtures/baseline_metrics.json;
+    # an improvement (or a dip within tolerance) always passes. Both are config, not
+    # constants, so which metrics gate and how much slack they get stay tunable.
+    gate_tolerance: float = 0.02
+    gate_metrics: list[str] = Field(default_factory=lambda: ["recall@10", "ndcg@10"])
 
 
 class Settings(BaseSettings):

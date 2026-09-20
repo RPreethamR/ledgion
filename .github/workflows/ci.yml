@@ -1,0 +1,51 @@
+name: ci
+
+# Runs on every PR and on pushes to main. The whole job is the offline Tier-1
+# contract: no GPU, no network to model hubs, no API keys, and no model downloads
+# — so it works on a stock runner and on PRs from forks (which get no secrets).
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  tier1-gate:
+    runs-on: ubuntu-latest
+    env:
+      # `uv run` would otherwise re-sync to the default groups (which include the
+      # heavy `models` group) and pull torch back in; pin the env to what the
+      # explicit `uv sync --no-group models` step installs.
+      UV_NO_SYNC: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Pin Python 3.11
+        run: uv python install 3.11
+
+      - name: Install (torch-free — excludes the models group)
+        # Core deps + the dev group (ruff, pytest). sentence-transformers/torch live
+        # in the `models` group and are dropped here, so nothing multi-GB installs.
+        run: uv sync --no-group models
+
+      - name: Lint
+        run: uv run ruff check .
+
+      - name: Test
+        # Tests needing a model, a live Qdrant, or PDFs skip cleanly (pytest.skip /
+        # importorskip); the offline core — metrics, tier1, gate, fixture guards —
+        # runs for real.
+        run: uv run pytest -q
+
+      - name: Tier-1 gate (fixtures vs baseline)
+        # Scores retrieval against committed fixtures/*.npz and fails the build if
+        # a gated metric regresses past eval.gate_tolerance below
+        # fixtures/baseline_metrics.json. Improvements always pass.
+        env:
+          LEDGION_RETRIEVAL__BACKEND: fixture
+          LEDGION_QDRANT__MODE: memory
+        run: uv run ledgion eval --tier 1 --gate

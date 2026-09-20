@@ -58,6 +58,7 @@ chunk:
 
 retrieval:
   top_k: 50                 # candidates pulled before rerank
+  backend: dense            # dense (real, model-backed) | fixture (offline CI, reads fixtures/*.npz)
 
 fusion:
   method: rrf               # rrf | weighted
@@ -99,3 +100,7 @@ eval:
     - ndcg@10
     - mrr
     - hit@1
+  gate_tolerance: 0.02        # a gated metric may dip this far below baseline before the build fails
+  gate_metrics:               # metrics the CI gate enforces against fixtures/baseline_metrics.json
+    - recall@10
+    - ndcg@10

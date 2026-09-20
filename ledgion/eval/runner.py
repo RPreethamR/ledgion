@@ -162,11 +162,19 @@ def format_compare(old: dict, new: dict) -> str:
 
 
 def _build_retriever(cfg: Settings):
-    """The real dense retriever (needs the bge model + a populated Qdrant).
+    """Build the retriever ``retrieval.backend`` selects.
 
-    Imported lazily so tier1's offline tests — which inject a fake retriever —
-    never pull in torch/qdrant, and ``ledgion eval --help`` stays light.
+    ``"dense"`` is the real, model-backed path (bge + a populated Qdrant);
+    ``"fixture"`` is the offline path that replays committed fixtures with no model
+    (this is what CI runs). Imported lazily so tier1's offline tests — which inject
+    a fake retriever — never pull in torch/qdrant, and ``ledgion eval --help`` stays
+    light.
     """
+    if cfg.retrieval.backend == "fixture":
+        from ledgion.retrieve.fixture import FixtureRetriever
+
+        return FixtureRetriever.from_config(cfg)
+
     from ledgion.retrieve.dense import DenseRetriever
 
     return DenseRetriever.from_config(cfg)
