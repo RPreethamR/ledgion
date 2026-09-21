@@ -72,3 +72,60 @@ reach those, Phase 6 might.
 
 Ragas deferred (500MB LangChain+datasets). Faithfulness via
 deterministic citation_validity instead.
+
+## Phase 5 — CI gate (offline Tier 1)
+Tier 1 now runs on a bare runner: no GPU, network, API keys, or
+model download — fork PRs included. `make fixture` dumps the live
+setup to three committed artifacts: index.npz (all 2181 dense
+vectors + parallel chunk_id/doc_id/page_num, no text, ~7MB),
+query_vectors.npz (one embedding per golden qid, same bge revision
+and query prefix the retriever applies), manifest.json (model/
+revision, chunk count, qids, git SHA, timestamp). Both .npz written
+sorted → byte-deterministic; only the manifest carries a timestamp.
+
+FixtureRetriever replays index.npz into an in-process Qdrant and
+looks up the query vector by qid. Parity by construction: it composes
+the real DenseRetriever with a precomputed-lookup embedder over the
+same QdrantIndexer, so query path, point ids, and page-collapse are
+identical. Offline metrics matched the live baseline to the digit
+(r@10 .500, ndcg@10 .300); parity holds across all 30 questions.
+Two startup guards fail loudly with "run make fixture": manifest
+revision != config revision, and any golden qid missing a vector.
+
+Gate (eval/gate.py) compares overall recall@10/ndcg@10 to
+fixtures/baseline_metrics.json; fails the build only on a drop >
+eval.gate_tolerance (.02) — improvements always pass. Compares the
+6dp-rounded drop so an exactly-tolerance dip passes (else .5-.48 =
+.02000…018 trips). baseline_metrics.json is hand-updated in the PR
+that improves it, never auto-written by a run.
+
+sentence-transformers (→ torch, multi-GB) moved out of core into a
+PEP 735 `models` default group; CI runs `uv sync --no-group models`
+for a torch-free env (verified: torch unimportable, 0 mentions in
+`uv tree --no-group models`). numpy promoted to explicit core dep.
+Retriever picked by config (retrieval.backend dense|fixture) so CI
+uses the literal `ledgion eval --tier 1 --gate` with
+LEDGION_RETRIEVAL__BACKEND=fixture — no CLI flag needed.
+
+CI (.github/workflows/ci.yml, on PR + push main): ruff → pytest →
+gate. Model/Qdrant/PDF tests skip cleanly (importorskip / pytest.skip),
+never error. Verified in a throwaway torch-free env: ruff+pytest pass
+with 2 skips, gate green (exit 0); synthetic regression exits 1.
+60 tests green locally.
+
+Read: the gate guards the ranking metrics (r@10/ndcg@10), not the
+finding metric (r@50) — a strategy that finds more evidence but ranks
+it worse still fails, which is the right bar. Cheap + hermetic is the
+whole point: a gate that needed the 4GB model would get skipped on
+forks and guard nothing.
+
+## Phase 6 — hybrid retrieval (prediction, pre-run)
+A hypothesis to test, not a feature to add. Baseline: the evidence
+page is found 82% of the time (r@50 .817) but ranked in the top 10
+only 50% (r@10 .500). BM25 should help on two fronts:
+  1. Surface the ~18% dense never finds — especially prose, where
+     r@50 is only .679 (~4-5 questions never surface evidence at all).
+  2. Sharpen rank position where exact tokens — ticker symbols, GAAP
+     line items — appear verbatim and dense embeddings blur them.
+Prediction recorded before running; the delta between this and the
+measured hybrid result is the point.
