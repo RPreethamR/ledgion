@@ -57,7 +57,7 @@ chunk:
   respect_page_boundary: true   # chunks never span a page boundary
 
 retrieval:
-  top_k: 1                 # candidates pulled before rerank
+  top_k: 50                 # candidates pulled before rerank
   backend: dense            # dense (real, model-backed) | fixture (offline CI, reads fixtures/*.npz)
 
 fusion:
