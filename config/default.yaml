@@ -51,6 +51,7 @@ sparse:
   fastembed_model: Qdrant/bm25
   lowercase: true           # tokeniser knobs — recorded in results + fixture manifest
   token_pattern: "[A-Za-z0-9]+"
+  remove_stopwords: false   # drop config/stopwords_en.txt tokens (ablation, default off)
   k1: 1.5                   # BM25Okapi hyperparameters
   b: 0.75
   epsilon: 0.25

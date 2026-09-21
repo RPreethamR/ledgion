@@ -24,6 +24,7 @@ the absolute BM25 score. The returned list order *is* the rank (position 0 = bes
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import pickle
@@ -31,12 +32,43 @@ import re
 from collections.abc import Sequence
 from pathlib import Path
 
-from ledgion.config import Settings
+from ledgion.config import REPO_ROOT, Settings
 from ledgion.interfaces import Chunk, RetrievedChunk
 
 # Persisted-index format version. Bumped if the pickle layout changes so a stale
 # cache from an older Ledgion is treated as a miss rather than mis-loaded.
 _PICKLE_VERSION = 1
+
+# Vendored English stop word list (see the file header for its source). A committed
+# text file, NOT a scikit-learn import: the offline CI env installs without the
+# models group, so importing sklearn at runtime would break the sparse tests there.
+STOPWORDS_PATH = REPO_ROOT / "config" / "stopwords_en.txt"
+
+
+@functools.lru_cache(maxsize=1)
+def load_stopwords(path: str = str(STOPWORDS_PATH)) -> frozenset[str]:
+    """The vendored stop words as a lowercase set (blank lines and #-comments skipped)."""
+    words = {
+        line.strip().lower()
+        for line in Path(path).read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.startswith("#")
+    }
+    return frozenset(words)
+
+
+@functools.lru_cache(maxsize=1)
+def stopword_list_hash() -> str:
+    """A stable digest of the stop-word *set* (sorted, so file reordering is a no-op).
+
+    Folded into the tokeniser config only when stop-word removal is ON, so editing
+    the list invalidates every stop-word-enabled BM25 cache and trips the fixture
+    staleness guard — while leaving stop-word-disabled configs untouched.
+    """
+    h = hashlib.sha256()
+    for word in sorted(load_stopwords()):
+        h.update(word.encode("utf-8"))
+        h.update(b"\x00")
+    return h.hexdigest()[:16]
 
 
 class BM25Tokenizer:
@@ -48,28 +80,58 @@ class BM25Tokenizer:
     fixture guard.
     """
 
-    def __init__(self, *, lowercase: bool, token_pattern: str) -> None:
+    def __init__(
+        self, *, lowercase: bool, token_pattern: str, remove_stopwords: bool = False
+    ) -> None:
         self.lowercase = lowercase
         self.token_pattern = token_pattern
         self._re = re.compile(token_pattern)
+        self.remove_stopwords = remove_stopwords
+        # The set actually applied — empty when disabled, so a disabled tokeniser is
+        # byte-for-byte the pre-feature behaviour and never reads the list file.
+        self._stopwords = load_stopwords() if remove_stopwords else frozenset()
 
     @classmethod
     def from_config(cls, cfg: Settings) -> BM25Tokenizer:
-        return cls(lowercase=cfg.sparse.lowercase, token_pattern=cfg.sparse.token_pattern)
+        return cls(
+            lowercase=cfg.sparse.lowercase,
+            token_pattern=cfg.sparse.token_pattern,
+            remove_stopwords=cfg.sparse.remove_stopwords,
+        )
 
     def tokenize(self, text: str) -> list[str]:
         if self.lowercase:
             text = text.lower()
-        return self._re.findall(text)
+        tokens = self._re.findall(text)
+        if self._stopwords:
+            # Filter on the lowercased form so removal is independent of the
+            # lowercase knob; the returned token itself is left as produced.
+            tokens = [t for t in tokens if t.lower() not in self._stopwords]
+        return tokens
 
     def config_dict(self) -> dict:
         """The policy, as a plain dict — for the manifest and the staleness guard."""
-        return {"lowercase": self.lowercase, "token_pattern": self.token_pattern}
+        return {
+            "lowercase": self.lowercase,
+            "token_pattern": self.token_pattern,
+            "remove_stopwords": self.remove_stopwords,
+            "stopwords_sha256": stopword_list_hash() if self.remove_stopwords else None,
+        }
 
 
 def tokenizer_config(cfg: Settings) -> dict:
-    """The tokeniser policy the resolved config asks for (manifest + guard)."""
-    return {"lowercase": cfg.sparse.lowercase, "token_pattern": cfg.sparse.token_pattern}
+    """The tokeniser policy the resolved config asks for (manifest + guard).
+
+    Includes the stop-word setting and — only when it is ON — a hash of the vendored
+    list, so `_cache_path` and the fixture guard both react to toggling the knob or
+    editing the list.
+    """
+    return {
+        "lowercase": cfg.sparse.lowercase,
+        "token_pattern": cfg.sparse.token_pattern,
+        "remove_stopwords": cfg.sparse.remove_stopwords,
+        "stopwords_sha256": stopword_list_hash() if cfg.sparse.remove_stopwords else None,
+    }
 
 
 def bm25_params(cfg: Settings) -> dict:
@@ -175,7 +237,9 @@ class SparseRetriever:
         obj.chunks = state["chunks"]
         tok = state["tokenizer"]
         obj.tokenizer = BM25Tokenizer(
-            lowercase=tok["lowercase"], token_pattern=tok["token_pattern"]
+            lowercase=tok["lowercase"],
+            token_pattern=tok["token_pattern"],
+            remove_stopwords=tok.get("remove_stopwords", False),
         )
         params = state["params"]
         obj.k1, obj.b, obj.epsilon = params["k1"], params["b"], params["epsilon"]

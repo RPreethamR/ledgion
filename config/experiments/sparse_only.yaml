@@ -45,6 +45,7 @@ sparse:
   fastembed_model: Qdrant/bm25
   lowercase: true
   token_pattern: "[A-Za-z0-9]+"
+  remove_stopwords: false
   k1: 1.5
   b: 0.75
   epsilon: 0.25

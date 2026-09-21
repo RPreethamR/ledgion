@@ -98,6 +98,11 @@ class SparseConfig(BaseModel):
     k1: float = 1.5
     b: float = 0.75
     epsilon: float = 0.25
+    # Drop English stop words (the vendored config/stopwords_en.txt list) inside the
+    # tokeniser. Default OFF so it stays a one-variable ablation; a hash of the list
+    # is folded into the tokeniser config (cache key + manifest) when it is ON, so
+    # toggling it — or editing the list — never reuses a stale BM25 index.
+    remove_stopwords: bool = False
 
 
 class ChunkConfig(BaseModel):

@@ -10,8 +10,18 @@ rankings exactly.
 
 from __future__ import annotations
 
+import re
+
+from ledgion.config import load_config
 from ledgion.interfaces import Chunk, RetrievedChunk
-from ledgion.retrieve.sparse import BM25Tokenizer, SparseRetriever
+from ledgion.retrieve.sparse import (
+    BM25Tokenizer,
+    SparseRetriever,
+    load_stopwords,
+    tokenizer_config,
+)
+
+_PATTERN = r"[A-Za-z0-9]+"
 
 # ~20 tiny documents. Doc 0 is the only one that mentions "xilinx", so a query for
 # it must rank doc 0 first; the rest are financial-flavoured filler to give BM25 a
@@ -107,5 +117,60 @@ def test_persist_load_roundtrip_is_identical(tmp_path):
         after = [(rc.chunk.chunk_id, rc.score) for rc in reloaded.retrieve(query, top_k=10)]
         assert before == after
     # The persisted policy survived the roundtrip.
-    assert reloaded.tokenizer.config_dict() == {"lowercase": True, "token_pattern": r"[A-Za-z0-9]+"}
+    assert reloaded.tokenizer.config_dict() == {
+        "lowercase": True,
+        "token_pattern": _PATTERN,
+        "remove_stopwords": False,
+        "stopwords_sha256": None,
+    }
     assert (reloaded.k1, reloaded.b, reloaded.epsilon) == (1.5, 0.75, 0.25)
+
+
+# --- stop-word ablation (config knob, default off) --------------------------
+
+
+def test_stopwords_off_matches_current_behaviour():
+    # With the toggle OFF, tokenisation is byte-for-byte the pre-feature behaviour:
+    # lowercase then the token_pattern regex, nothing removed.
+    tok = BM25Tokenizer(lowercase=True, token_pattern=_PATTERN, remove_stopwords=False)
+    sample = (
+        "The Company's net revenue increased 44% in FY2022, and the Data Center "
+        "segment drove the change; see Item 7 for the MD&A discussion."
+    )
+    assert tok.tokenize(sample) == re.findall(_PATTERN, sample.lower())
+
+
+def test_stopwords_on_removes_from_docs_and_queries():
+    sw = load_stopwords()
+    off = BM25Tokenizer(lowercase=True, token_pattern=_PATTERN, remove_stopwords=False)
+    on = BM25Tokenizer(lowercase=True, token_pattern=_PATTERN, remove_stopwords=True)
+
+    doc = "The company reported an increase in net revenue during the year"
+    query = "What drove the increase in revenue?"
+    for text in (doc, query):  # same tokeniser for index and query
+        off_tokens = off.tokenize(text)
+        on_tokens = on.tokenize(text)
+        assert any(t in sw for t in off_tokens), f"{text!r} should contain stop words"
+        assert all(t not in sw for t in on_tokens)  # none survive
+        assert on_tokens == [t for t in off_tokens if t not in sw]  # exactly off minus stopwords
+    # a content word is kept on both sides
+    assert "revenue" in on.tokenize(doc)
+    assert "revenue" in on.tokenize(query)
+
+
+def test_toggling_stopwords_changes_cache_key():
+    from ledgion.retrieve.sparse import _cache_path
+
+    cfg = load_config()
+    cfg_off = cfg.model_copy(
+        update={"sparse": cfg.sparse.model_copy(update={"remove_stopwords": False})}
+    )
+    cfg_on = cfg.model_copy(
+        update={"sparse": cfg.sparse.model_copy(update={"remove_stopwords": True})}
+    )
+
+    assert _cache_path(cfg_off) == _cache_path(cfg_off)  # deterministic
+    assert _cache_path(cfg_off) != _cache_path(cfg_on)  # toggling picks a different index
+    # the ON policy embeds the list hash (so cache key + manifest guard react to edits)
+    assert tokenizer_config(cfg_on)["stopwords_sha256"] is not None
+    assert tokenizer_config(cfg_off)["stopwords_sha256"] is None
