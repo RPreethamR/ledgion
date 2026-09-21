@@ -119,13 +119,21 @@ it worse still fails, which is the right bar. Cheap + hermetic is the
 whole point: a gate that needed the 4GB model would get skipped on
 forks and guard nothing.
 
-## Phase 6 — hybrid retrieval (prediction, pre-run)
-A hypothesis to test, not a feature to add. Baseline: the evidence
-page is found 82% of the time (r@50 .817) but ranked in the top 10
-only 50% (r@10 .500). BM25 should help on two fronts:
-  1. Surface the ~18% dense never finds — especially prose, where
-     r@50 is only .679 (~4-5 questions never surface evidence at all).
-  2. Sharpen rank position where exact tokens — ticker symbols, GAAP
-     line items — appear verbatim and dense embeddings blur them.
-Prediction recorded before running; the delta between this and the
-measured hybrid result is the point.
+## Phase 6 — hypothesis (recorded before running)
+Baseline: r@10 .500, r@50 .817, ndcg@10 .300.
+Prose r@50 .679 is the weak point — ~4-5 questions never surface
+evidence at all.
+
+Predict BM25 helps two ways:
+1. Recall floor — surfaces some of the ~18% dense misses, most
+   likely prose questions where the evidence page names a
+   specific entity or section the embedder smooths over.
+2. Rank position — exact tokens (tickers, GAAP line items,
+   fiscal years) appear verbatim, so sparse should push buried
+   pages up. Expect the r@10 gain to exceed the r@50 gain.
+
+Expect numeric to benefit more than prose on ndcg@10, since
+numeric questions name line items that match literally.
+
+Risk: at 2181 chunks over 5 filings, BM25 may just retrieve the
+same pages dense already finds, and RRF adds nothing.

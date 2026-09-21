@@ -40,11 +40,18 @@ from ledgion.config import REPO_ROOT, Settings
 from ledgion.ingest.index import DENSE_VECTOR, QdrantIndexer
 from ledgion.interfaces import Chunk, RetrievedChunk
 from ledgion.retrieve.dense import DenseRetriever
+from ledgion.retrieve.sparse import bm25_params, corpus_fingerprint, tokenizer_config
 
 FIXTURES_DIR = REPO_ROOT / "fixtures"
 INDEX_FILE = "index.npz"
 QUERY_VECTORS_FILE = "query_vectors.npz"
+SPARSE_RANKINGS_FILE = "sparse_rankings.npz"
 MANIFEST_FILE = "manifest.json"
+
+# Depth at which sparse rankings are stored, independent of retrieval.top_k. The
+# fixture holds the top-STORED_DEPTH sparse chunk_ids per qid; a run truncates to
+# top_k and hard-fails if top_k exceeds this (there is nothing deeper to serve).
+STORED_DEPTH = 100
 
 
 def _fixture_error(fixtures_dir: Path, detail: str) -> SystemExit:
@@ -201,3 +208,177 @@ def _load_index_into_memory(cfg: Settings, fixtures_dir: Path):
     )
     indexer.upsert(chunks, list(vectors))
     return indexer.client
+
+
+# -- fixture-backed sparse retrieval -----------------------------------------
+
+
+class FixtureSparseRetriever:
+    """The offline sparse arm: replays frozen BM25 rankings instead of a live index.
+
+    ``fixtures/sparse_rankings.npz`` holds, per golden qid, the top-STORED_DEPTH
+    chunk_ids and their BM25 scores — computed once, locally, over the full corpus by
+    ``make fixture``. This retriever looks them up by question (mapped to qid via the
+    golden set), truncates to ``top_k``, and joins each chunk_id to its ``page_num``
+    via ``index.npz`` (the fixture stores pages, not text). The hybrid path can then
+    run in CI as: live dense search over fixture vectors → these frozen sparse
+    rankings → the user's fusion → page-level scoring, all with no model or network.
+
+    Construction runs the same class of guard as the dense fixture, so a stale sparse
+    fixture fails loudly rather than scoring against the wrong rankings:
+
+    1. the manifest must carry a ``sparse`` block (fixtures were built with sparse);
+    2. its backend, tokeniser settings and BM25 parameters must equal the resolved
+       config (the sparse ablation knobs actually used);
+    3. its corpus fingerprint must equal the live one recomputed from ``index.npz``;
+    4. every golden qid must have stored rankings.
+
+    A fifth guard is deferred to query time: ``top_k`` must not exceed the stored
+    depth (there is nothing deeper to serve).
+    """
+
+    def __init__(
+        self,
+        *,
+        rankings_by_qid: dict[str, tuple[list[str], list[float]]],
+        qid_by_question: dict[str, str],
+        page_by_chunk_id: dict[str, int],
+        doc_by_chunk_id: dict[str, str],
+        stored_depth: int,
+    ) -> None:
+        self._rankings = rankings_by_qid
+        self._qid_by_question = qid_by_question
+        self._page_by_chunk_id = page_by_chunk_id
+        self._doc_by_chunk_id = doc_by_chunk_id
+        self._stored_depth = stored_depth
+
+    def retrieve(self, query: str, *, top_k: int) -> list[RetrievedChunk]:
+        # Depth guard: the fixture only stores STORED_DEPTH candidates per qid.
+        if top_k > self._stored_depth:
+            raise SystemExit(
+                f"retrieval.top_k={top_k} exceeds the stored sparse depth "
+                f"{self._stored_depth}: the fixture has nothing deeper to serve. "
+                f"Lower retrieval.top_k, or raise STORED_DEPTH and run make fixture."
+            )
+        try:
+            qid = self._qid_by_question[query]
+        except KeyError as exc:
+            raise KeyError(
+                f"no frozen sparse ranking for question {query!r}; it is not a golden "
+                f"question this fixture set was built for (run make fixture)"
+            ) from exc
+
+        chunk_ids, scores = self._rankings[qid]
+        results: list[RetrievedChunk] = []
+        for cid, score in zip(chunk_ids[:top_k], scores[:top_k], strict=True):
+            # Pages, not text: metadata the page-level ranking never reads is placeholder.
+            chunk = Chunk(
+                chunk_id=cid,
+                doc_id=self._doc_by_chunk_id.get(cid, ""),
+                page_num=self._page_by_chunk_id[cid],
+                text="",
+                company="",
+                ticker="",
+                fiscal_year=0,
+                form_type="",
+            )
+            results.append(RetrievedChunk(chunk=chunk, score=float(score)))
+        return results
+
+    @classmethod
+    def from_config(
+        cls,
+        cfg: Settings,
+        *,
+        fixtures_dir: Path = FIXTURES_DIR,
+        golden: Sequence[dict] | None = None,
+    ) -> FixtureSparseRetriever:
+        fixtures_dir = Path(fixtures_dir)
+        manifest = _load_manifest(fixtures_dir)
+
+        index = _load_index_arrays(fixtures_dir)
+        live_fp = corpus_fingerprint([str(cid) for cid in index["chunk_id"]])
+        _check_sparse_manifest(cfg, manifest, fixtures_dir, live_fp)
+
+        if golden is None:
+            from ledgion.eval.runner import load_golden
+
+            golden = load_golden()
+
+        rankings = _load_sparse_rankings(fixtures_dir)
+        missing = [row["qid"] for row in golden if row["qid"] not in rankings]
+        if missing:
+            raise _fixture_error(
+                fixtures_dir,
+                f"{len(missing)} golden qid(s) have no frozen sparse ranking: "
+                f"{', '.join(missing[:5])}{' …' if len(missing) > 5 else ''}",
+            )
+
+        page_by_chunk_id = {
+            str(cid): int(pn) for cid, pn in zip(index["chunk_id"], index["page_num"], strict=True)
+        }
+        doc_by_chunk_id = {
+            str(cid): str(did) for cid, did in zip(index["chunk_id"], index["doc_id"], strict=True)
+        }
+        qid_by_question = {row["question"]: row["qid"] for row in golden}
+        stored_depth = int(manifest["sparse"]["stored_depth"])
+        return cls(
+            rankings_by_qid=rankings,
+            qid_by_question=qid_by_question,
+            page_by_chunk_id=page_by_chunk_id,
+            doc_by_chunk_id=doc_by_chunk_id,
+            stored_depth=stored_depth,
+        )
+
+
+def _check_sparse_manifest(
+    cfg: Settings, manifest: dict, fixtures_dir: Path, live_fingerprint: str
+) -> None:
+    """Fail loudly (run make fixture) if the fixture's sparse provenance has drifted
+    from the resolved config or the committed corpus. Mirrors the dense revision guard."""
+    sparse = manifest.get("sparse")
+    if not sparse:
+        raise _fixture_error(
+            fixtures_dir,
+            "manifest has no 'sparse' block — the sparse fixtures were never generated",
+        )
+    checks = [
+        ("sparse backend", sparse.get("backend"), cfg.sparse.backend),
+        ("sparse tokenizer", sparse.get("tokenizer"), tokenizer_config(cfg)),
+        ("sparse bm25 parameters", sparse.get("bm25"), bm25_params(cfg)),
+        ("corpus fingerprint", sparse.get("corpus_fingerprint"), live_fingerprint),
+    ]
+    for label, fixture_val, config_val in checks:
+        if fixture_val != config_val:
+            raise _fixture_error(
+                fixtures_dir,
+                f"fixture {label} {fixture_val!r} != {config_val!r}",
+            )
+
+
+def _load_index_arrays(fixtures_dir: Path) -> dict:
+    """The chunk_id/doc_id/page_num arrays from index.npz (no vectors loaded)."""
+    path = fixtures_dir / INDEX_FILE
+    if not path.exists():
+        raise _fixture_error(fixtures_dir, f"{path} not found")
+    with np.load(path) as data:
+        return {
+            "chunk_id": data["chunk_id"],
+            "doc_id": data["doc_id"],
+            "page_num": data["page_num"],
+        }
+
+
+def _load_sparse_rankings(fixtures_dir: Path) -> dict[str, tuple[list[str], list[float]]]:
+    """Load sparse_rankings.npz into {qid: (chunk_ids, scores)}, best-first per qid."""
+    path = fixtures_dir / SPARSE_RANKINGS_FILE
+    if not path.exists():
+        raise _fixture_error(fixtures_dir, f"{path} not found")
+    with np.load(path) as data:
+        qids = [str(q) for q in data["qids"]]
+        chunk_ids = data["chunk_ids"]
+        scores = data["scores"]
+    return {
+        qid: ([str(c) for c in chunk_ids[i]], [float(s) for s in scores[i]])
+        for i, qid in enumerate(qids)
+    }

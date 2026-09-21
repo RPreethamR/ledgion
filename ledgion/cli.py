@@ -21,7 +21,11 @@ _TierOption = typer.Option(
     1, "--tier", "-t", min=1, max=2, help="1 = offline retrieval, 2 = judged."
 )
 _CompareOption = typer.Option(
-    None, "--compare", help="A previous results/<hash>.json to print a delta table against."
+    None,
+    "--compare",
+    help="A previous results/<hash>.json to tabulate alongside this run. Repeatable: "
+    "pass --compare once per prior run to render a multi-run ablation table (deltas "
+    "vs the dense baseline).",
 )
 _GateOption = typer.Option(
     False,
@@ -97,8 +101,9 @@ def _print_eval_summary(report: dict) -> None:
     metrics = report["metrics"]
     counts = metrics.get("counts", {})
     dirty = "  (dirty)" if report.get("git_dirty") else ""
+    backend = report.get("config", {}).get("retrieval", {}).get("backend", "?")
     typer.echo(
-        f"Tier {report['tier']}  ·  config {report['config_hash'][:12]}  ·  "
+        f"Tier {report['tier']}  ·  {backend}  ·  config {report['config_hash'][:12]}  ·  "
         f"git {report['git_sha'][:12]}{dirty}"
     )
     specs = list(metrics["overall"].keys())
@@ -119,7 +124,7 @@ def _print_eval_summary(report: dict) -> None:
 def run_eval(
     config: Path | None = _ConfigOption,
     tier: int = _TierOption,
-    compare: Path | None = _CompareOption,
+    compare: list[Path] | None = _CompareOption,
     gate: bool = _GateOption,
 ) -> None:
     """Run the offline eval, write results/<hash>.json, and print a summary."""
@@ -133,10 +138,10 @@ def run_eval(
     _print_eval_summary(report)
     typer.echo(f"\nwrote {path}")
 
-    if compare is not None:
-        old = runner.load_report(compare)
+    if compare:
+        reports = [report] + [runner.load_report(p) for p in compare]
         typer.echo("")
-        typer.echo(runner.format_compare(old, report))
+        typer.echo(runner.format_ablation(reports))
 
     if gate:
         from ledgion.eval.gate import check_gate, load_baseline
@@ -174,10 +179,17 @@ def fixture(config: Path | None = _ConfigOption) -> None:
     summary = generate_fixtures(cfg)
     typer.echo(
         f"wrote {summary['chunk_count']} chunk vectors, "
-        f"{summary['query_count']} query vectors"
+        f"{summary['query_count']} query vectors, "
+        f"sparse rankings at depth {summary['stored_depth']}  ->  {summary['out_dir']}"
     )
-    for key in ("index", "query_vectors", "manifest"):
-        typer.echo(f"  {summary[key]}")
+    sizes = summary["sizes"]
+    for name in ("index.npz", "query_vectors.npz", "sparse_rankings.npz", "manifest.json"):
+        typer.echo(f"  {name:<22} {sizes[name] / 1024:>8.1f} KiB")
+    added = sizes["sparse_rankings.npz"]
+    typer.echo(
+        f"  total {summary['total_bytes'] / 1024:.1f} KiB "
+        f"(sparse rankings add {added / 1024:.1f} KiB)"
+    )
 
 
 def main() -> None:

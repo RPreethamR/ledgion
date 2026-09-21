@@ -49,6 +49,11 @@ reranker:
 sparse:
   backend: rank_bm25        # rank_bm25 first, then fastembed into Qdrant
   fastembed_model: Qdrant/bm25
+  lowercase: true           # tokeniser knobs — recorded in results + fixture manifest
+  token_pattern: "[A-Za-z0-9]+"
+  k1: 1.5                   # BM25Okapi hyperparameters
+  b: 0.75
+  epsilon: 0.25
 
 chunk:
   size: 448
@@ -58,7 +63,7 @@ chunk:
 
 retrieval:
   top_k: 50                 # candidates pulled before rerank
-  backend: dense            # dense (real, model-backed) | fixture (offline CI, reads fixtures/*.npz)
+  backend: dense            # dense | sparse | hybrid (real, model-backed) | fixture (offline CI)
 
 fusion:
   method: rrf               # rrf | weighted

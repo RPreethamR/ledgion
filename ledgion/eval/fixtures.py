@@ -1,8 +1,8 @@
 """Regenerate the offline Tier-1 fixtures from the live local setup.
 
 ``make fixture`` (→ ``ledgion fixture``) runs this against the populated docker
-Qdrant and the real bge model to produce the three committed artifacts the CI
-gate replays:
+Qdrant and the real bge model to produce the committed artifacts the CI gate and
+the offline hybrid path replay:
 
 * ``index.npz`` — every corpus chunk's dense vector plus parallel
   ``chunk_id``/``doc_id``/``page_num`` arrays. No chunk *text*: Tier 1 scores
@@ -11,23 +11,36 @@ gate replays:
   the *same* ``embed_query`` (hence the same bge revision and query instruction
   prefix) the live retriever applies, so the offline path queries with an
   identical vector.
+* ``sparse_rankings.npz`` — per golden qid, the top-STORED_DEPTH sparse chunk_ids
+  and their BM25 scores, computed over the *full corpus* by a real BM25 index.
+  Depth is fixed (not tied to retrieval.top_k) so one fixture serves any top_k up
+  to that depth; the offline sparse retriever truncates at runtime. No chunk text
+  and no full BM25 index ship to CI — only these frozen per-query rankings.
 * ``manifest.json`` — provenance: the embedding model_id + revision, the chunk
-  count, the golden qids, the source git SHA, and a generation timestamp. The
-  revision is what ``FixtureRetriever`` guards against a config mismatch.
+  count, the golden qids, the source git SHA, a timestamp, AND a ``sparse`` block
+  (backend, tokeniser settings, BM25 parameters, stored depth, and a corpus
+  fingerprint) that the sparse/hybrid fixture guard checks against the config.
 
-The two ``.npz`` files are written deterministically (chunks sorted by chunk_id,
-queries by qid) so regenerating on unchanged inputs yields identical bytes; only
-the manifest carries a wall-clock timestamp.
+Dense and sparse artifacts are regenerated **together, atomically** (computed from
+one corpus scroll, staged in a temp dir, then moved into place) so they can never
+drift apart — the corpus fingerprint that guards the sparse path is only meaningful
+if the sparse rankings and the dense index describe the same corpus.
+
+The ``.npz`` files are written deterministically (chunks sorted by chunk_id,
+queries/qids sorted by qid) so regenerating on unchanged inputs yields identical
+bytes; only the manifest carries a wall-clock timestamp.
 
 This module is import-safe without torch (numpy + qdrant only at import); the bge
-model is loaded lazily via ``BGEEmbedder`` when ``generate_fixtures`` actually
-runs, so it never burdens the offline path that merely imports the package.
+model and the BM25 stack are loaded lazily when ``generate_fixtures`` runs, so they
+never burden the offline path that merely imports the package.
 """
 
 from __future__ import annotations
 
 import datetime as dt
 import json
+import os
+import shutil
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -35,6 +48,7 @@ import numpy as np
 
 from ledgion.config import Settings
 from ledgion.ingest.index import DENSE_VECTOR
+from ledgion.interfaces import Chunk
 
 
 def _default_fixtures_dir() -> Path:
@@ -44,9 +58,10 @@ def _default_fixtures_dir() -> Path:
     return FIXTURES_DIR
 
 
-def _scroll_index(cfg: Settings) -> list[dict]:
-    """Pull every point's dense vector + (chunk_id, doc_id, page_num) from the live
-    collection, sorted by chunk_id for a deterministic dump."""
+def _scroll_corpus(cfg: Settings) -> list[dict]:
+    """Pull every point's dense vector + full payload from the live collection, once,
+    sorted by chunk_id for a deterministic dump. One scroll feeds both the dense index
+    and the BM25 build, so the two artifacts describe exactly the same corpus."""
     from qdrant_client import QdrantClient
 
     client = QdrantClient(url=cfg.qdrant.url, prefer_grpc=cfg.qdrant.prefer_grpc)
@@ -57,7 +72,7 @@ def _scroll_index(cfg: Settings) -> list[dict]:
             collection_name=cfg.qdrant.collection_name,
             limit=512,
             offset=offset,
-            with_payload=["chunk_id", "doc_id", "page_num"],
+            with_payload=True,
             with_vectors=[DENSE_VECTOR],
         )
         for p in points:
@@ -68,6 +83,11 @@ def _scroll_index(cfg: Settings) -> list[dict]:
                     "chunk_id": payload["chunk_id"],
                     "doc_id": payload["doc_id"],
                     "page_num": int(payload["page_num"]),
+                    "text": payload["text"],
+                    "company": payload["company"],
+                    "ticker": payload["ticker"],
+                    "fiscal_year": payload["fiscal_year"],
+                    "form_type": payload["form_type"],
                     "vector": np.asarray(vector, dtype=np.float32),
                 }
             )
@@ -105,18 +125,82 @@ def _write_query_vectors(cfg: Settings, golden: Sequence[dict], out_dir: Path) -
     return path
 
 
+def _write_sparse_rankings(
+    cfg: Settings, records: Sequence[dict], golden: Sequence[dict], out_dir: Path
+) -> tuple[Path, int]:
+    """Build a real BM25 index over the full corpus and freeze the top-STORED_DEPTH
+    (chunk_id, score) list per golden qid. Returns the path and the depth used."""
+    from ledgion.retrieve.fixture import STORED_DEPTH
+    from ledgion.retrieve.sparse import BM25Tokenizer, SparseRetriever
+
+    chunks = [
+        Chunk(
+            chunk_id=r["chunk_id"],
+            doc_id=r["doc_id"],
+            page_num=r["page_num"],
+            text=r["text"],
+            company=r["company"],
+            ticker=r["ticker"],
+            fiscal_year=r["fiscal_year"],
+            form_type=r["form_type"],
+        )
+        for r in records
+    ]
+    sparse = SparseRetriever(
+        chunks=chunks,
+        tokenizer=BM25Tokenizer.from_config(cfg),
+        k1=cfg.sparse.k1,
+        b=cfg.sparse.b,
+        epsilon=cfg.sparse.epsilon,
+    )
+    depth = min(STORED_DEPTH, len(chunks))
+
+    rows = sorted(golden, key=lambda r: r["qid"])
+    qids = [row["qid"] for row in rows]
+    chunk_ids: list[list[str]] = []
+    scores: list[list[float]] = []
+    for row in rows:
+        retrieved = sparse.retrieve(row["question"], top_k=depth)
+        chunk_ids.append([rc.chunk.chunk_id for rc in retrieved])
+        scores.append([rc.score for rc in retrieved])
+
+    path = out_dir / "sparse_rankings.npz"
+    np.savez(
+        path,
+        qids=np.array(qids),
+        chunk_ids=np.array(chunk_ids),
+        scores=np.array(scores, dtype=np.float32),
+    )
+    return path, depth
+
+
 def _write_manifest(
-    cfg: Settings, golden: Sequence[dict], chunk_count: int, out_dir: Path
+    cfg: Settings,
+    golden: Sequence[dict],
+    records: Sequence[dict],
+    stored_depth: int,
+    out_dir: Path,
 ) -> Path:
     from ledgion.eval.runner import git_sha
+    from ledgion.retrieve.sparse import bm25_params, corpus_fingerprint, tokenizer_config
 
     manifest = {
         "embedding": {
             "model_id": cfg.embedding.model_id,
             "revision": cfg.embedding.revision,
         },
-        "chunk_count": chunk_count,
+        "chunk_count": len(records),
         "golden_qids": sorted(row["qid"] for row in golden),
+        # The sparse ablation's provenance — the sparse/hybrid fixture guard checks
+        # every field here against the resolved config (and the corpus fingerprint
+        # against index.npz), same pattern as the embedding-revision guard.
+        "sparse": {
+            "backend": cfg.sparse.backend,
+            "tokenizer": tokenizer_config(cfg),
+            "bm25": bm25_params(cfg),
+            "stored_depth": stored_depth,
+            "corpus_fingerprint": corpus_fingerprint([r["chunk_id"] for r in records]),
+        },
         "source_git_sha": git_sha(),
         "generated_at": dt.datetime.now(dt.UTC).isoformat(timespec="seconds"),
     }
@@ -128,7 +212,7 @@ def _write_manifest(
 def generate_fixtures(
     cfg: Settings, *, out_dir: Path | None = None, golden: Sequence[dict] | None = None
 ) -> dict:
-    """Regenerate all three fixtures. Returns a small summary for the CLI to print."""
+    """Regenerate all fixtures atomically. Returns a summary (counts + byte sizes)."""
     out_dir = Path(out_dir) if out_dir is not None else _default_fixtures_dir()
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -137,20 +221,38 @@ def generate_fixtures(
 
         golden = load_golden()
 
-    records = _scroll_index(cfg)
+    # Compute the dense index first: an empty collection is a hard error before any
+    # file is touched, so a failed run never leaves half-written fixtures.
+    records = _scroll_corpus(cfg)
     if not records:
         raise SystemExit(
             f"collection {cfg.qdrant.collection_name!r} is empty; run `ledgion ingest` first."
         )
 
-    index_path = _write_index(records, out_dir)
-    query_path = _write_query_vectors(cfg, golden, out_dir)
-    manifest_path = _write_manifest(cfg, golden, len(records), out_dir)
+    # Stage every artifact in a temp dir, then move each into place. Dense and sparse
+    # are written from the *same* scroll, so the fingerprint that ties them can't lie.
+    staging = out_dir / ".fixture_tmp"
+    if staging.exists():
+        shutil.rmtree(staging)
+    staging.mkdir(parents=True)
+    try:
+        _write_index(records, staging)
+        _write_query_vectors(cfg, golden, staging)
+        _, depth = _write_sparse_rankings(cfg, records, golden, staging)
+        _write_manifest(cfg, golden, records, depth, staging)
 
+        names = ["index.npz", "query_vectors.npz", "sparse_rankings.npz", "manifest.json"]
+        for name in names:
+            os.replace(staging / name, out_dir / name)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
+    sizes = {name: (out_dir / name).stat().st_size for name in names}
     return {
         "chunk_count": len(records),
         "query_count": len(golden),
-        "index": str(index_path),
-        "query_vectors": str(query_path),
-        "manifest": str(manifest_path),
+        "stored_depth": depth,
+        "out_dir": str(out_dir),
+        "sizes": sizes,
+        "total_bytes": sum(sizes.values()),
     }
