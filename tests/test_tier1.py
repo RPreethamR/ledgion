@@ -50,7 +50,8 @@ def test_collapse_keeps_page_at_best_rank():
     # 52 must enter the page list exactly ONCE, at position 0 (its best rank); the
     # ranks-3-and-7 duplicates contribute nothing. The result is best-rank ascending.
     retrieved = _retrieved([52, 10, 52, 20, 30, 40, 52])
-    assert collapse_to_pages(retrieved) == [52, 10, 20, 30, 40]
+    doc = "AMCOR_2023_10K"  # _chunk's doc_id — keys are now (doc_id, page_num)
+    assert collapse_to_pages(retrieved) == [(doc, 52), (doc, 10), (doc, 20), (doc, 30), (doc, 40)]
 
 
 def test_collapse_empty_ranking():
@@ -113,8 +114,9 @@ def test_tier1_runs_offline_and_reports_by_answer_type():
     # per-question records carry the collapsed page ranking (so a moved number is
     # debuggable without re-running retrieval).
     by_qid = {r["qid"]: r for r in result["results"]}
-    assert by_qid["q_num"]["retrieved_pages"] == [52, 10, 20]
-    assert by_qid["q_prose"]["evidence_pages"] == [5]
+    doc = "AMCOR_2023_10K"
+    assert by_qid["q_num"]["retrieved_pages"] == [(doc, 52), (doc, 10), (doc, 20)]
+    assert by_qid["q_prose"]["evidence_pages"] == [5]  # golden provenance stays bare
 
 
 def test_recall_at_10_and_recall_at_k_are_distinct_columns():
@@ -147,6 +149,61 @@ def test_recall_at_10_and_recall_at_k_are_distinct_columns():
     assert per_q["recall@10"] == 0.0  # but not within the fixed top 10
     # both are reported as their own aggregate columns.
     assert set(result["metrics"]["overall"]) == {"recall@k", "recall@10"}
+
+
+def test_wrong_filing_page_collision_is_not_a_hit():
+    # Golden evidence is AMD page 56. A chunk from a DIFFERENT filing that happens to
+    # share page 56 must NOT count — scoring is on (doc_id, page), not bare page.
+    golden = [
+        {
+            "qid": "q",
+            "doc_id": "AMD_2022_10K",
+            "question": "q?",
+            "answer_type": "numeric",
+            "evidence_pages": [56],
+        }
+    ]
+
+    def _mixed(*pairs: tuple[str, int]) -> list[RetrievedChunk]:
+        return [
+            RetrievedChunk(
+                chunk=Chunk(
+                    chunk_id=f"{i:016x}",
+                    doc_id=doc,
+                    page_num=page,
+                    text="",
+                    company="",
+                    ticker="",
+                    fiscal_year=2022,
+                    form_type="10-K",
+                ),
+                score=1.0 - 0.01 * i,
+            )
+            for i, (doc, page) in enumerate(pairs)
+        ]
+
+    class _Canned:
+        def __init__(self, ranking: list[RetrievedChunk]) -> None:
+            self._ranking = ranking
+
+        def retrieve(self, query: str, *, top_k: int) -> list[RetrievedChunk]:
+            return self._ranking[:top_k]
+
+    specs = ["recall@k", "recall@10", "ndcg@10", "mrr", "hit@1"]
+
+    # rank 1 = wrong filing at the evidence page number; rank 2 = right filing, wrong page.
+    collision = _Canned(_mixed(("AMERICANEXPRESS_2022_10K", 56), ("AMD_2022_10K", 99)))
+    rec = run_tier1(golden, collision, top_k=20, metric_specs=specs, default_k=20)["results"][0]
+    assert rec["metrics"]["hit@1"] == 0.0
+    assert rec["metrics"]["recall@10"] == 0.0
+    assert rec["metrics"]["mrr"] == 0.0
+    assert rec["retrieved_pages"] == [("AMERICANEXPRESS_2022_10K", 56), ("AMD_2022_10K", 99)]
+
+    # Positive control: the SAME page number from the RIGHT filing does hit.
+    right = _Canned(_mixed(("AMD_2022_10K", 56)))
+    rec2 = run_tier1(golden, right, top_k=20, metric_specs=specs, default_k=20)["results"][0]
+    assert rec2["metrics"]["hit@1"] == 1.0
+    assert rec2["metrics"]["recall@10"] == 1.0
 
 
 def test_tier1_two_runs_are_identical():

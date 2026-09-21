@@ -1,7 +1,7 @@
 import math
 
 
-def recall_at_k(ranked: list[int], relevant: set[int], k: int) -> float:
+def recall_at_k(ranked: list[tuple[str, int]], relevant: set[tuple[str, int]], k: int) -> float:
     """Fraction of relevant pages appearing in the top k."""
     if not relevant:
         raise ValueError("relevant must not be empty")
@@ -14,7 +14,7 @@ def recall_at_k(ranked: list[int], relevant: set[int], k: int) -> float:
     return retrieved_relevant / len(relevant)
 
 
-def hit_at_1(ranked: list[int], relevant: set[int]) -> float:
+def hit_at_1(ranked: list[tuple[str, int]], relevant: set[tuple[str, int]]) -> float:
     """1.0 if the top-ranked page is relevant, else 0.0."""
     if not relevant:
         raise ValueError("relevant must not be empty")
@@ -25,7 +25,7 @@ def hit_at_1(ranked: list[int], relevant: set[int]) -> float:
     return 1.0 if ranked[0] in relevant else 0.0
 
 
-def mrr(ranked: list[int], relevant: set[int]) -> float:
+def mrr(ranked: list[tuple[str, int]], relevant: set[tuple[str, int]]) -> float:
     """Reciprocal rank of the first relevant page. 0.0 if none."""
     if not relevant:
         raise ValueError("relevant must not be empty")
@@ -37,7 +37,7 @@ def mrr(ranked: list[int], relevant: set[int]) -> float:
     return 0.0
 
 
-def ndcg_at_k(ranked: list[int], relevant: set[int], k: int) -> float:
+def ndcg_at_k(ranked: list[tuple[str, int]], relevant: set[tuple[str, int]], k: int) -> float:
     """Binary-gain nDCG. IDCG is the ideal ordering given |relevant|."""
     if not relevant:
         raise ValueError("relevant must not be empty")

@@ -9,8 +9,9 @@ to a deduplicated page ranking, and scores that ranking against the golden
 Two CLAUDE.md rules shape this file:
 
 * **Scored at page level, never chunk level.** chunk_ids move with the chunker;
-  page numbers are the stable cross-strategy key. ``collapse_to_pages`` is the
-  one bridge from a chunk ranking to a page ranking.
+  (doc_id, page_num) is the stable cross-strategy key. ``collapse_to_pages`` is the
+  one bridge from a chunk ranking to that page-key ranking — doc-qualified so a
+  wrong-filing chunk sharing the evidence page number can't score as a hit.
 * **Deterministic.** No wall-clock, no RNG, no dict-ordering dependence — the
   same retriever output always yields the same numbers, so a re-run of a config
   reproduces its ``results/<hash>.json`` byte-for-byte.
@@ -38,25 +39,32 @@ from ledgion.interfaces import RetrievedChunk, Retriever
 _GROUPS = ("numeric", "prose")
 
 
-def collapse_to_pages(retrieved: Sequence[RetrievedChunk]) -> list[int]:
-    """Collapse a chunk ranking to a deduplicated page ranking.
+def collapse_to_pages(retrieved: Sequence[RetrievedChunk]) -> list[tuple[str, int]]:
+    """Collapse a chunk ranking to a deduplicated (doc_id, page_num) ranking.
 
     The retriever returns chunks best-first, so list position *is* the rank. Each
-    page enters the result once, at its best (lowest) rank; later chunks from an
-    already-seen page contribute nothing. The result is therefore ordered by best
-    rank ascending.
+    (doc_id, page_num) key enters the result once, at its best (lowest) rank; later
+    chunks from an already-seen key contribute nothing. The result is therefore
+    ordered by best rank ascending.
 
-    Example: chunks from page 52 at ranks 1, 3 and 7 → page 52 appears once, at
+    The key is (doc_id, page_num), **not a bare page number**: with a multi-filing
+    corpus every 10-K has a page 56, so a chunk from the *wrong* filing that shares
+    the evidence page number would otherwise count as a hit. Qualifying the page
+    with its doc_id means a match is the right page of the right filing. (Within a
+    filing the page number is still the stable cross-strategy key — chunk_ids move
+    with the chunker, doc_id + page_num do not.)
+
+    Example: chunks from (AMD, 52) at ranks 1, 3 and 7 → the key appears once, at
     position 0; ranks 3 and 7 are dropped.
     """
-    seen: set[int] = set()
-    pages: list[int] = []
+    seen: set[tuple[str, int]] = set()
+    keys: list[tuple[str, int]] = []
     for rc in retrieved:
-        page = rc.chunk.page_num
-        if page not in seen:
-            seen.add(page)
-            pages.append(page)
-    return pages
+        key = (rc.chunk.doc_id, rc.chunk.page_num)
+        if key not in seen:
+            seen.add(key)
+            keys.append(key)
+    return keys
 
 
 def _apply_metric(
@@ -135,7 +143,7 @@ def run_tier1(
     for row in golden_rows:
         retrieved = retriever.retrieve(row["question"], top_k=top_k)
         ranked = collapse_to_pages(retrieved)
-        relevant = set(row["evidence_pages"])
+        relevant = {(row["doc_id"], page) for page in row["evidence_pages"]}
         per_question.append(
             {
                 "qid": row["qid"],
