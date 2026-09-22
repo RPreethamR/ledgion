@@ -17,6 +17,9 @@ dependencies = [
     "python-dotenv>=1.2.3",
     "pyyaml>=6.0.3",
     "qdrant-client>=1.19.0",
+    # BM25 sparse retrieval. Pure Python + numpy, torch-free, so it stays in core:
+    # the offline BM25 unit tests must run in the `--no-group models` CI env.
+    "rank-bm25>=0.2.2",
     "rapidfuzz>=3.14.6",
     "typer>=0.27.2",
 ]

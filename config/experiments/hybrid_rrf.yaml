@@ -1,16 +1,13 @@
-# Experiment: baseline_dense — the first recorded configuration.
+# Experiment: hybrid_rrf — dense + sparse, fused by Reciprocal Rank Fusion.
 #
-# Dense-only retrieval (embed query -> Qdrant cosine -> top_k). NO BM25, NO
-# fusion, NO reranker, NO query rewriting: the honest floor every later ablation
-# (sparse, fusion, rerank, query rewriting) is measured against.
+# The Phase 6 headline candidate. Both arms pull retrieval.top_k candidates; the
+# user's reciprocal_rank_fusion (fusion.method: rrf, smoothed by fusion.rrf_k)
+# merges them into one ranking. One knob vs baseline_dense (retrieval.backend:
+# dense -> hybrid), so the delta isolates what fusion adds over dense alone; compare
+# against sparse_only too to see whether fusion beats either arm on its own.
 #
-# An experiment file is a FROZEN, SELF-CONTAINED snapshot. `ledgion eval --config`
-# reads this file *instead of* config/default.yaml (env/.env still layer on top),
-# so it must fully specify the run — that is what makes its results/<hash>.json
-# reproducible forever. Later experiments are sibling files in config/experiments/
-# that change one knob at a time; the delta between their results is the point.
-#
-#   uv run ledgion eval --tier 1 --config config/experiments/baseline_dense.yaml
+#   uv run ledgion eval --tier 1 --config config/experiments/hybrid_rrf.yaml \
+#     --compare results/<dense_hash>.json --compare results/<sparse_hash>.json
 
 paths:
   data_dir: data
@@ -61,17 +58,17 @@ chunk:
   respect_page_boundary: true
 
 retrieval:
-  top_k: 50                 # candidates pulled before rerank (dense-only feeds them straight through)
-  backend: dense            # the knob the sparse/hybrid experiments flip
+  top_k: 50
+  backend: hybrid           # the knob this experiment flips (vs baseline_dense)
 
 fusion:
-  method: rrf
-  rrf_k: 60
+  method: rrf               # reciprocal rank fusion (the user's fusion logic)
+  rrf_k: 60                 # RRF smoothing constant
   dense_weight: 1.0
   sparse_weight: 1.0
 
 qdrant:
-  mode: docker              # docker (dev, corpus loaded) | memory (CI, in-process)
+  mode: docker
   url: http://localhost:6333
   path: qdrant_storage
   collection_name: ledgion_filings
@@ -95,8 +92,8 @@ tracing:
   secret_key_env: LANGFUSE_SECRET_KEY
 
 eval:
-  tier: 1                   # Tier 1 = deterministic, fully offline
-  ragas_enabled: false      # Tier 2 (judged) only; never gates a build
+  tier: 1
+  ragas_enabled: false
   judge_model: gemini-2.0-flash
   metrics:
     - recall@k

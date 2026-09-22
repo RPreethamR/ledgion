@@ -1,16 +1,11 @@
-# Experiment: baseline_dense — the first recorded configuration.
+# Experiment: hybrid_plain_sw0.5 — dense + plain (raw) BM25, weighted RRF.
 #
-# Dense-only retrieval (embed query -> Qdrant cosine -> top_k). NO BM25, NO
-# fusion, NO reranker, NO query rewriting: the honest floor every later ablation
-# (sparse, fusion, rerank, query rewriting) is measured against.
+# Weighted-RRF sweep member: dense_weight 1.0, sparse_weight 0.5, rrf_k 60,
+# sparse.remove_stopwords false. One knob varies across the sweep — sparse_weight.
+# Pre-registered: with sparse_weight <= 0.5 no sparse-only chunk can enter the
+# top-50 (0.5/(60+1) < 1/(60+50)), so recall@k must equal dense's exactly.
 #
-# An experiment file is a FROZEN, SELF-CONTAINED snapshot. `ledgion eval --config`
-# reads this file *instead of* config/default.yaml (env/.env still layer on top),
-# so it must fully specify the run — that is what makes its results/<hash>.json
-# reproducible forever. Later experiments are sibling files in config/experiments/
-# that change one knob at a time; the delta between their results is the point.
-#
-#   uv run ledgion eval --tier 1 --config config/experiments/baseline_dense.yaml
+#   uv run ledgion eval --tier 1 --config config/experiments/hybrid_plain_sw0.5.yaml
 
 paths:
   data_dir: data
@@ -61,17 +56,17 @@ chunk:
   respect_page_boundary: true
 
 retrieval:
-  top_k: 50                 # candidates pulled before rerank (dense-only feeds them straight through)
-  backend: dense            # the knob the sparse/hybrid experiments flip
+  top_k: 50
+  backend: hybrid
 
 fusion:
   method: rrf
   rrf_k: 60
   dense_weight: 1.0
-  sparse_weight: 1.0
+  sparse_weight: 0.5
 
 qdrant:
-  mode: docker              # docker (dev, corpus loaded) | memory (CI, in-process)
+  mode: docker
   url: http://localhost:6333
   path: qdrant_storage
   collection_name: ledgion_filings
@@ -95,8 +90,8 @@ tracing:
   secret_key_env: LANGFUSE_SECRET_KEY
 
 eval:
-  tier: 1                   # Tier 1 = deterministic, fully offline
-  ragas_enabled: false      # Tier 2 (judged) only; never gates a build
+  tier: 1
+  ragas_enabled: false
   judge_model: gemini-2.0-flash
   metrics:
     - recall@k

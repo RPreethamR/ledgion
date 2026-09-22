@@ -87,6 +87,22 @@ class SparseConfig(BaseModel):
     # rank_bm25 first (simple, in-process), then FastEmbed BM25 into Qdrant.
     backend: Literal["rank_bm25", "fastembed"] = "rank_bm25"
     fastembed_model: str = "Qdrant/bm25"
+    # BM25 tokenisation. An ablation knob, so it lives in config: it is folded into
+    # config_hash (hence results/<hash>.json) and recorded in the fixture manifest.
+    # lowercase is applied *before* token_pattern, whose every regex match is a token.
+    lowercase: bool = True
+    token_pattern: str = r"[A-Za-z0-9]+"
+    # Okapi BM25 hyperparameters (the rank_bm25 BM25Okapi defaults). k1 tunes term-
+    # frequency saturation, b the length normalisation, epsilon the IDF floor. Also
+    # recorded in the manifest; the sparse fixture guard fails if they drift from config.
+    k1: float = 1.5
+    b: float = 0.75
+    epsilon: float = 0.25
+    # Drop English stop words (the vendored config/stopwords_en.txt list) inside the
+    # tokeniser. Default OFF so it stays a one-variable ablation; a hash of the list
+    # is folded into the tokeniser config (cache key + manifest) when it is ON, so
+    # toggling it — or editing the list — never reuses a stale BM25 index.
+    remove_stopwords: bool = False
 
 
 class ChunkConfig(BaseModel):
@@ -101,12 +117,13 @@ class ChunkConfig(BaseModel):
 
 class RetrievalConfig(BaseModel):
     top_k: int = 20  # candidates pulled before rerank
-    # Which Retriever the eval harness builds. "dense" is the real, model-backed
-    # path (bge + a populated Qdrant); "fixture" is the offline CI path that reads
-    # committed fixtures/*.npz into an in-process Qdrant and never loads a model.
-    # Config-driven (not a CLI flag) so `ledgion eval --tier 1 --gate` runs the
-    # offline path in CI purely via LEDGION_RETRIEVAL__BACKEND=fixture.
-    backend: Literal["dense", "fixture"] = "dense"
+    # Which Retriever the eval harness builds. The real, model-backed strategies are
+    # "dense" (bge + Qdrant), "sparse" (BM25 over chunk text), and "hybrid" (both,
+    # fused). "fixture" is the offline CI path that reads committed fixtures/*.npz
+    # into an in-process Qdrant and never loads a model. Config-driven (not a CLI
+    # flag) so `ledgion eval --tier 1 --gate` runs the offline path in CI purely via
+    # LEDGION_RETRIEVAL__BACKEND=fixture.
+    backend: Literal["dense", "sparse", "hybrid", "fixture"] = "dense"
 
 
 class FusionConfig(BaseModel):

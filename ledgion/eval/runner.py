@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from collections.abc import Sequence
 from pathlib import Path
 
 from ledgion.config import REPO_ROOT, Settings, config_hash, load_config
@@ -158,22 +159,111 @@ def format_compare(old: dict, new: dict) -> str:
     return "\n".join(lines)
 
 
+# -- ablation table (many runs at once) --------------------------------------
+
+# Canonical column order for the ablation table; any extra metric a run carries is
+# appended after these. recall@k is the full-depth recall (retrieval.top_k).
+_METRIC_ORDER = ("hit@1", "mrr", "ndcg@10", "recall@10", "recall@k")
+_LABEL_WIDTH = 26
+_COL_WIDTH = 11
+
+
+def _run_backend(report: dict) -> str:
+    return report.get("config", {}).get("retrieval", {}).get("backend", "?")
+
+
+def _run_label(report: dict) -> str:
+    """A row label that surfaces the ablation knobs, not just an opaque hash — so a
+    weight sweep reads as ``hybrid sw0.25 stop <hash>`` rather than six ``hybrid`` rows."""
+    cfg = report.get("config", {})
+    parts = [_run_backend(report)]
+    if _run_backend(report) == "hybrid":
+        sw = cfg.get("fusion", {}).get("sparse_weight")
+        if sw is not None:
+            parts.append(f"sw{sw}")
+    if cfg.get("sparse", {}).get("remove_stopwords"):
+        parts.append("stop")
+    parts.append(report.get("config_hash", "?")[:6])
+    return " ".join(parts)
+
+
+def _delta_cell(current: float, baseline: float) -> str:
+    return f"{round(current - baseline, 4):>+{_COL_WIDTH}.4f}"
+
+
+def _ablation_specs(report: dict) -> list[str]:
+    overall = report["metrics"].get("overall", {})
+    ordered = [m for m in _METRIC_ORDER if m in overall]
+    ordered += [m for m in overall if m not in ordered]
+    return ordered
+
+
+def format_ablation(reports: Sequence[dict]) -> str:
+    """A multi-run ablation table: one row per config, every metric, split by answer
+    type (overall / numeric / prose), with deltas against the dense baseline.
+
+    The baseline is the dense run among ``reports`` (else the first run). Each
+    non-baseline row is followed by a ``Δ vs dense`` line so a reader sees both the
+    absolute number and the movement the ablation bought.
+    """
+    if not reports:
+        return "no runs to compare"
+
+    baseline = next((r for r in reports if _run_backend(r) == "dense"), reports[0])
+    specs = _ablation_specs(baseline)
+    lines = [
+        f"ablation   baseline = {_run_label(baseline)}   ({len(reports)} runs)",
+    ]
+
+    for group in _COMPARE_GROUPS:
+        base_group = baseline["metrics"].get(group)
+        if base_group is None:
+            continue
+        lines.append("")
+        lines.append(f"{group:<{_LABEL_WIDTH}}" + "".join(f"{s:>{_COL_WIDTH}}" for s in specs))
+        lines.append("-" * (_LABEL_WIDTH + _COL_WIDTH * len(specs)))
+        for report in reports:
+            group_metrics = report["metrics"].get(group)
+            if group_metrics is None:
+                continue
+            values = "".join(
+                f"{group_metrics.get(s, float('nan')):>{_COL_WIDTH}.4f}" for s in specs
+            )
+            lines.append(f"{_run_label(report):<{_LABEL_WIDTH}}{values}")
+            if report is not baseline:
+                deltas = "".join(
+                    _delta_cell(group_metrics.get(s, 0.0), base_group.get(s, 0.0)) for s in specs
+                )
+                lines.append(f"{'  delta':<{_LABEL_WIDTH}}{deltas}")
+    return "\n".join(lines)
+
+
 # -- end-to-end run (the real, model-backed path) ----------------------------
 
 
 def _build_retriever(cfg: Settings):
     """Build the retriever ``retrieval.backend`` selects.
 
-    ``"dense"`` is the real, model-backed path (bge + a populated Qdrant);
-    ``"fixture"`` is the offline path that replays committed fixtures with no model
-    (this is what CI runs). Imported lazily so tier1's offline tests — which inject
-    a fake retriever — never pull in torch/qdrant, and ``ledgion eval --help`` stays
+    ``"dense"``/``"sparse"``/``"hybrid"`` are the real, model-backed strategies (bge
+    and/or BM25 over a populated Qdrant); ``"fixture"`` is the offline path that
+    replays the committed dense fixtures with no model (this is what the CI gate
+    runs). Everything is imported lazily so tier1's offline tests — which inject a
+    fake retriever — never pull in torch/qdrant, and ``ledgion eval --help`` stays
     light.
     """
-    if cfg.retrieval.backend == "fixture":
+    backend = cfg.retrieval.backend
+    if backend == "fixture":
         from ledgion.retrieve.fixture import FixtureRetriever
 
         return FixtureRetriever.from_config(cfg)
+    if backend == "sparse":
+        from ledgion.retrieve.sparse import SparseRetriever
+
+        return SparseRetriever.from_config(cfg)
+    if backend == "hybrid":
+        from ledgion.retrieve.fusion import HybridRetriever
+
+        return HybridRetriever.from_config(cfg)
 
     from ledgion.retrieve.dense import DenseRetriever
 

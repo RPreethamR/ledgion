@@ -10,8 +10,10 @@ eval:
 	uv run ledgion eval
 
 # Regenerate the offline Tier-1 fixtures from the live setup (docker Qdrant + bge).
-# Run after the corpus, the golden set, or the embedding revision changes, then
-# commit fixtures/*.npz + manifest.json.
+# One atomic pass writes the dense index, query vectors, AND the frozen sparse BM25
+# rankings + manifest — computed from a single corpus scroll so dense and sparse can
+# never drift apart. Run after the corpus, the golden set, the embedding revision, or
+# any sparse knob changes, then commit fixtures/*.npz + manifest.json.
 fixture:
 	uv run ledgion fixture
 

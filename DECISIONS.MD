@@ -119,13 +119,92 @@ it worse still fails, which is the right bar. Cheap + hermetic is the
 whole point: a gate that needed the 4GB model would get skipped on
 forks and guard nothing.
 
-## Phase 6 — hybrid retrieval (prediction, pre-run)
-A hypothesis to test, not a feature to add. Baseline: the evidence
-page is found 82% of the time (r@50 .817) but ranked in the top 10
-only 50% (r@10 .500). BM25 should help on two fronts:
-  1. Surface the ~18% dense never finds — especially prose, where
-     r@50 is only .679 (~4-5 questions never surface evidence at all).
-  2. Sharpen rank position where exact tokens — ticker symbols, GAAP
-     line items — appear verbatim and dense embeddings blur them.
-Prediction recorded before running; the delta between this and the
-measured hybrid result is the point.
+## Phase 6 — hypothesis (recorded before running)
+Baseline: r@10 .500, r@50 .817, ndcg@10 .300.
+Prose r@50 .679 is the weak point — ~4-5 questions never surface
+evidence at all.
+
+Predict BM25 helps two ways:
+1. Recall floor — surfaces some of the ~18% dense misses, most
+   likely prose questions where the evidence page names a
+   specific entity or section the embedder smooths over.
+2. Rank position — exact tokens (tickers, GAAP line items,
+   fiscal years) appear verbatim, so sparse should push buried
+   pages up. Expect the r@10 gain to exceed the r@50 gain.
+
+Expect numeric to benefit more than prose on ndcg@10, since
+numeric questions name line items that match literally.
+
+Risk: at 2181 chunks over 5 filings, BM25 may just retrieve the
+same pages dense already finds, and RRF adds nothing.
+
+## Metric correction — (doc_id, page) scoring
+Tier 1 scored bare page numbers, so a wrong filing's page N
+counted as a hit for the right filing's page N. Now keyed on
+(doc_id, page_num). Metric logic unchanged — membership tests
+over hashable keys; the keys were fixed upstream in
+collapse_to_pages. Regression test added.
+
+Dense baseline, old → new:
+  hit@1 .133 → .133    r@10 .500 → .500    r@50 .817 → .817
+  mrr   .263 → .252    ndcg@10 .300 → .291
+Only rank-sensitive metrics moved: phantom hits ranked above
+the real evidence page in a few questions, mostly prose.
+
+The bug was biased toward sparse: under correct scoring sparse
+r@10 fell .267 → .233 while dense r@10 was unchanged. Fixed
+before running hybrid for that reason.
+
+Baseline lowered deliberately — the old metric was wrong.
+Supersedes the Phase 4 baseline numbers above.
+
+## Phase 6 — revised prediction (after 2×2, before hybrid)
+Complementarity at K=50, 35 evidence pairs:
+  dense × sparse:     both 11, dense-only 16, sparse-only 1, neither 7
+  dense × sparse_sw:  both 13, dense-only 14, sparse-only 1, neither 7
+Fusion recall ceiling .828 / .833 vs dense .817. Original
+prediction 1 (BM25 raises the recall floor) is effectively
+falsified in advance.
+
+Pre-registered grid, sparse_weight ∈ {1.0, 0.5, 0.25}, k=60:
+- 1.0: recall@50 falls — sparse noise displaces deep dense-only
+  evidence; agreement on wrong pages risks hit@1.
+- 0.5, 0.25: below the 61/110 threshold, fused top-50 = dense's
+  top-50 reordered. recall@50 fixed at .817; any gain is ranking.
+All rows reported regardless of outcome.
+
+## Hybrid budget fix
+HybridRetriever returned the full fused union (up to 2×top_k
+chunks) rather than top_k, so hybrid would have been scored on a
+candidate pool twice dense's size. Now capped at top_k in the
+retriever; reciprocal_rank_fusion still returns the full fused list.
+Second evaluation bug, after bare-page scoring, that would have
+flattered hybrid. Both caught before the first hybrid run.
+
+## Phase 6 — result
+7 rows, pre-registered grid, all reported:
+                     hit@1   mrr    ndcg@10  r@10    r@50
+  dense              .133    .252   .291     .500    .817
+  hybrid sw1.0       +.033   −.024  −.055    −.117   −.167
+  hybrid sw0.5       ±0      −.021  −.033    −.033   ±0
+  hybrid sw0.25      +.033   +.013  −.011    −.033   ±0
+  hybrid sw1.0 stop  +.033   −.011  −.029    −.083   −.150
+  hybrid sw0.5 stop  +.033   +.003  −.018    −.067   ±0
+  hybrid sw0.25 stop +.067   +.036  +.014    −.050   ±0
+
+Original hypothesis:
+  1. BM25 raises the recall floor — WRONG. One evidence page
+     dense misses.
+  2. r@10 gain exceeds r@50 gain — WRONG. r@10 falls in every row.
+  3. Numeric benefits more than prose — WRONG. Where hybrid helps
+     at all, it's prose.
+  4. Risk: RRF adds nothing — effectively CORRECT.
+Revised (after 2×2):
+  sw1.0 recall@50 falls — CORRECT, by five questions' worth.
+  sw1.0 hit@1 at risk — WRONG. Rose by one question.
+  sw ≤ 0.5 recall@50 exactly .817 — CORRECT, 4/4 to the digit.
+
+Decision: dense stays default. No hybrid row passes the recall@10
+gate. Below sw 0.55 the candidate set equals dense's, so under a
+reranker hybrid is identical to dense by construction.
+Hybrid code and sparse fixture kept; re-run at corpus scale.

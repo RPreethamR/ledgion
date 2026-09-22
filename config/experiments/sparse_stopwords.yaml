@@ -1,16 +1,12 @@
-# Experiment: baseline_dense — the first recorded configuration.
+# Experiment: sparse_stopwords — BM25 with English stop-word removal.
 #
-# Dense-only retrieval (embed query -> Qdrant cosine -> top_k). NO BM25, NO
-# fusion, NO reranker, NO query rewriting: the honest floor every later ablation
-# (sparse, fusion, rerank, query rewriting) is measured against.
+# One knob flipped vs sparse_only (sparse.remove_stopwords: false -> true), nothing
+# else, so the delta isolates what dropping stop words buys the lexical arm. The
+# Phase-6 diagnostic showed long questions full of common words (does/have/on/its/…)
+# drown the one distinctive company token; this is the direct test of that.
 #
-# An experiment file is a FROZEN, SELF-CONTAINED snapshot. `ledgion eval --config`
-# reads this file *instead of* config/default.yaml (env/.env still layer on top),
-# so it must fully specify the run — that is what makes its results/<hash>.json
-# reproducible forever. Later experiments are sibling files in config/experiments/
-# that change one knob at a time; the delta between their results is the point.
-#
-#   uv run ledgion eval --tier 1 --config config/experiments/baseline_dense.yaml
+#   uv run ledgion eval --tier 1 --config config/experiments/sparse_stopwords.yaml \
+#     --compare results/<sparse_only_hash>.json
 
 paths:
   data_dir: data
@@ -49,7 +45,7 @@ sparse:
   fastembed_model: Qdrant/bm25
   lowercase: true
   token_pattern: "[A-Za-z0-9]+"
-  remove_stopwords: false
+  remove_stopwords: true    # the knob this experiment flips (vs sparse_only)
   k1: 1.5
   b: 0.75
   epsilon: 0.25
@@ -61,8 +57,8 @@ chunk:
   respect_page_boundary: true
 
 retrieval:
-  top_k: 50                 # candidates pulled before rerank (dense-only feeds them straight through)
-  backend: dense            # the knob the sparse/hybrid experiments flip
+  top_k: 50
+  backend: sparse
 
 fusion:
   method: rrf
@@ -71,7 +67,7 @@ fusion:
   sparse_weight: 1.0
 
 qdrant:
-  mode: docker              # docker (dev, corpus loaded) | memory (CI, in-process)
+  mode: docker
   url: http://localhost:6333
   path: qdrant_storage
   collection_name: ledgion_filings
@@ -95,8 +91,8 @@ tracing:
   secret_key_env: LANGFUSE_SECRET_KEY
 
 eval:
-  tier: 1                   # Tier 1 = deterministic, fully offline
-  ragas_enabled: false      # Tier 2 (judged) only; never gates a build
+  tier: 1
+  ragas_enabled: false
   judge_model: gemini-2.0-flash
   metrics:
     - recall@k
