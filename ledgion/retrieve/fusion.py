@@ -8,11 +8,11 @@ Rank Fusion (RRF), smoothed by ``fusion.rrf_k``.
 Division of labour (see CLAUDE.md working agreement): **candidate gathering, config
 wiring, and the Retriever interface here are Claude's; the fusion maths in
 ``reciprocal_rank_fusion`` is the user's** — it is the number that has to be
-explained in an interview, so it is left as a documented stub. To keep the
-surrounding scaffolding testable before that stub is filled in, ``HybridRetriever``
-takes the fusion as an injectable ``fuse`` callable (defaulting to
-``reciprocal_rank_fusion``): tests pass a fake fuse to verify gathering, and a
-separate test pins that the real stub raises ``NotImplementedError``.
+explained in an interview, so it is implemented explicitly here. To keep the
+surrounding scaffolding independently testable, ``HybridRetriever`` takes the fusion
+as an injectable ``fuse`` callable (defaulting to ``reciprocal_rank_fusion``):
+tests can pass a fake fuse to verify candidate gathering separately from the real
+fusion maths.
 
 The fused ranking is truncated back to ``retrieval.top_k`` chunks, so hybrid is
 scored over the **same candidate budget as dense** (top_k in from each arm, top_k
@@ -25,6 +25,7 @@ full fused union; ``HybridRetriever`` applies the cap.
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from dataclasses import replace
 
 from ledgion.config import Settings
 from ledgion.interfaces import RetrievedChunk, Retriever
@@ -34,12 +35,12 @@ def reciprocal_rank_fusion(
     dense_ranked: Sequence[RetrievedChunk],
     sparse_ranked: Sequence[RetrievedChunk],
     k: int,
+    dense_weight: float = 1.0,
+    sparse_weight: float = 1.0,
 ) -> list[RetrievedChunk]:
-    """Fuse two rankings into one by Reciprocal Rank Fusion.  **[USER WRITES THIS]**
+    """Fuse two rankings into one by weighted Reciprocal Rank Fusion.
 
     This is the Phase 6 fusion logic the user authors (Claude scaffolds around it).
-    It is intentionally unimplemented; ``HybridRetriever`` accepts an injectable
-    ``fuse`` so the rest of the pipeline is exercisable before this lands.
 
     Contract to implement against:
 
@@ -48,26 +49,82 @@ def reciprocal_rank_fusion(
     * A chunk's identity across the two lists is ``rc.chunk.chunk_id`` (the same
       chunk may appear in both, at different ranks).
     * ``k`` is the RRF smoothing constant (``fusion.rrf_k``, default 60).
+    * ``dense_weight`` and ``sparse_weight`` control how strongly each retrieval
+      arm contributes. With both set to ``1.0`` this is standard RRF.
 
-    RRF assigns each chunk the score ``sum(1 / (k + rank))`` over the lists it
-    appears in (rank 1-based). Return the **full** fused ranking — every distinct
-    chunk from either list, **best-first** (highest fused score), each appearing once,
-    with ``score`` set to its fused RRF score. Do **not** truncate here:
-    ``HybridRetriever`` caps the result at the ``top_k`` candidate budget, so this
-    function returns the whole union. Break ties deterministically (e.g. by chunk_id)
-    so the ranking — and therefore ``results/<hash>.json`` — is reproducible.
+    Weighted RRF assigns each chunk the score
+    ``sum(weight / (k + rank))`` over the lists it appears in (rank 1-based).
+    Return the **full** fused ranking — every distinct chunk from either list,
+    **best-first** (highest fused score), each appearing once, with ``score`` set
+    to its fused RRF score. Do **not** truncate here: ``HybridRetriever`` caps the
+    result at the ``top_k`` candidate budget, so this function returns the whole
+    union. Break ties deterministically by ``chunk_id`` so the ranking — and
+    therefore ``results/<hash>.json`` — is reproducible.
 
-    (``fusion.dense_weight`` / ``fusion.sparse_weight`` exist in config for a later
-    weighted-RRF ablation; plain RRF ignores them.)
+    With both weights at their defaults of ``1.0`` this is standard equal-weight
+    RRF. Lowering ``sparse_weight`` allows sparse retrieval to influence ordering
+    without necessarily allowing sparse-only candidates to displace dense
+    candidates from the final candidate budget.
     """
-    raise NotImplementedError(
-        "reciprocal_rank_fusion is the user's to implement (Phase 6 fusion logic). "
-        "See this function's docstring for the RRF contract."
+    scores: dict[str, float] = {}
+    chunks: dict[str, RetrievedChunk] = {}
+
+    # Each arm contributes at most once per chunk. If an upstream retriever ever
+    # returns a duplicate chunk, keep its first occurrence because that is its
+    # best rank in the already-best-first ranking.
+    seen_dense: set[str] = set()
+
+    for rank, rc in enumerate(dense_ranked, start=1):
+        chunk_id = rc.chunk.chunk_id
+
+        if chunk_id in seen_dense:
+            continue
+
+        seen_dense.add(chunk_id)
+        chunks.setdefault(chunk_id, rc)
+        scores[chunk_id] = scores.get(chunk_id, 0.0) + (
+            dense_weight / (k + rank)
+        )
+
+    seen_sparse: set[str] = set()
+
+    for rank, rc in enumerate(sparse_ranked, start=1):
+        chunk_id = rc.chunk.chunk_id
+
+        if chunk_id in seen_sparse:
+            continue
+
+        seen_sparse.add(chunk_id)
+        chunks.setdefault(chunk_id, rc)
+        scores[chunk_id] = scores.get(chunk_id, 0.0) + (
+            sparse_weight / (k + rank)
+        )
+
+    # Highest RRF score first. chunk_id ascending gives deterministic ordering
+    # when two chunks receive exactly the same fused score.
+    ranked_chunk_ids = sorted(
+        scores,
+        key=lambda chunk_id: (-scores[chunk_id], chunk_id),
     )
 
+    return [
+        replace(chunks[chunk_id], score=scores[chunk_id])
+        for chunk_id in ranked_chunk_ids
+    ]
 
-# Type of a fusion function: two ranked lists + smoothing constant -> one ranking.
-FuseFn = Callable[[Sequence[RetrievedChunk], Sequence[RetrievedChunk], int], list[RetrievedChunk]]
+
+# Type of a fusion function:
+# two ranked lists + smoothing constant + arm weights -> one ranking.
+FuseFn = Callable[
+    [
+        Sequence[RetrievedChunk],
+        Sequence[RetrievedChunk],
+        int,
+        float,
+        float,
+    ],
+    list[RetrievedChunk],
+]
 
 
 class HybridRetriever:
@@ -79,19 +136,24 @@ class HybridRetriever:
         dense: Retriever,
         sparse: Retriever,
         rrf_k: int,
+        dense_weight: float = 1.0,
+        sparse_weight: float = 1.0,
         fuse: FuseFn = reciprocal_rank_fusion,
     ) -> None:
         self.dense = dense
         self.sparse = sparse
         self.rrf_k = rrf_k
-        # Injected so candidate gathering is testable with a fake fuse before the
-        # real reciprocal_rank_fusion is written; defaults to the user's function.
+        self.dense_weight = dense_weight
+        self.sparse_weight = sparse_weight
+
+        # Injected so candidate gathering remains independently testable with a
+        # fake fuse; defaults to the user's reciprocal_rank_fusion function.
         self.fuse = fuse
 
     @classmethod
     def from_config(cls, cfg: Settings) -> HybridRetriever:
         """Build the live hybrid retriever: real dense + real sparse arms, fused by
-        ``reciprocal_rank_fusion`` with ``fusion.rrf_k``."""
+        ``reciprocal_rank_fusion`` with the configured RRF parameters."""
         from ledgion.retrieve.dense import DenseRetriever
         from ledgion.retrieve.sparse import SparseRetriever
 
@@ -99,6 +161,8 @@ class HybridRetriever:
             dense=DenseRetriever.from_config(cfg),
             sparse=SparseRetriever.from_config(cfg),
             rrf_k=cfg.fusion.rrf_k,
+            dense_weight=cfg.fusion.dense_weight,
+            sparse_weight=cfg.fusion.sparse_weight,
         )
 
     def retrieve(self, query: str, *, top_k: int) -> list[RetrievedChunk]:
@@ -113,5 +177,13 @@ class HybridRetriever:
         """
         dense_ranked = self.dense.retrieve(query, top_k=top_k)
         sparse_ranked = self.sparse.retrieve(query, top_k=top_k)
-        fused = self.fuse(dense_ranked, sparse_ranked, self.rrf_k)
+
+        fused = self.fuse(
+            dense_ranked,
+            sparse_ranked,
+            self.rrf_k,
+            self.dense_weight,
+            self.sparse_weight,
+        )
+
         return fused[:top_k]
