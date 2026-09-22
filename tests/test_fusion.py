@@ -70,8 +70,28 @@ def test_hybrid_pulls_from_both_sources():
     assert [rc.chunk.page_num for rc in seen["dense"]] == [10, 20, 30]
     assert [rc.chunk.page_num for rc in seen["sparse"]] == [30, 40, 50]
     assert seen["k"] == 60
-    # The retriever returns exactly what the fusion produced.
-    assert out == seen["dense"] + seen["sparse"]
+    # The retriever returns the fused ranking capped at the top_k budget.
+    assert out == (seen["dense"] + seen["sparse"])[:3]
+
+
+def test_hybrid_returns_exactly_top_k_chunks():
+    # Disjoint arms -> the fused union is 2*top_k before truncation. Hybrid must emit
+    # exactly top_k, the SAME candidate budget as dense, so a recall gain can't be an
+    # artefact of a pool twice dense's size.
+    dense = _FakeRetriever(_ranked([(i, 100 + i) for i in range(50)]))
+    sparse = _FakeRetriever(_ranked([(1000 + i, 200 + i) for i in range(50)]))
+
+    def union_fuse(dense_ranked, sparse_ranked, k):
+        # No dedup needed (disjoint); returns the full 100-chunk union, best-first.
+        return list(dense_ranked) + list(sparse_ranked)
+
+    hybrid = HybridRetriever(dense=dense, sparse=sparse, rrf_k=60, fuse=union_fuse)
+    out = hybrid.retrieve("q", top_k=50)
+
+    assert len(out) == 50  # exactly the budget, not the 100-chunk union
+    assert len(out) == len(dense.retrieve("q", top_k=50))  # same budget as dense
+    # it kept the best-first prefix of the fused ranking (here, dense's 50)
+    assert out == (dense.retrieve("q", top_k=50) + sparse.retrieve("q", top_k=50))[:50]
 
 
 def test_stub_fusion_raises_not_implemented():

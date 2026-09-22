@@ -160,11 +160,13 @@ def test_offline_hybrid_runs_end_to_end_with_fake_fuse(tmp_path):
     np.savez(tmp_path / "query_vectors.npz", q1=np.array([0.0, 1.0, 0.0], dtype=np.float32))
     _write_manifest(
         tmp_path,
-        sparse_block=_sparse_block(cfg, ids, stored_depth=2),
+        sparse_block=_sparse_block(cfg, ids, stored_depth=3),
         revision=cfg.embedding.revision,
     )
-    # Sparse surfaces the evidence page 30 (which dense may bury behind a tie).
-    _write_rankings(tmp_path, {"q1": [(ids[2], 5.0), (ids[0], 2.0)]})
+    # Sparse surfaces the evidence page 30 (which dense may bury behind a tie). Depth 3
+    # == the whole 3-chunk corpus, so the top_k=3 budget cap drops nothing here (the
+    # cap itself is exercised in test_fusion.test_hybrid_returns_exactly_top_k_chunks).
+    _write_rankings(tmp_path, {"q1": [(ids[2], 5.0), (ids[0], 2.0), (ids[1], 1.0)]})
     golden = [
         {
             "qid": "q1",
@@ -191,15 +193,15 @@ def test_offline_hybrid_runs_end_to_end_with_fake_fuse(tmp_path):
     hybrid = HybridRetriever(dense=dense, sparse=sparse, rrf_k=cfg.fusion.rrf_k, fuse=fake_fuse)
 
     # The fused ranking draws on both arms: dense's page 20 and sparse's page 30.
-    pages = {rc.chunk.page_num for rc in hybrid.retrieve("Q?", top_k=2)}
+    pages = {rc.chunk.page_num for rc in hybrid.retrieve("Q?", top_k=3)}
     assert 20 in pages and 30 in pages
 
     result = run_tier1(
         golden,
         hybrid,
-        top_k=2,
+        top_k=3,
         metric_specs=["recall@k", "recall@10", "ndcg@10", "mrr", "hit@1"],
-        default_k=2,
+        default_k=3,
     )
     assert result["metrics"]["overall"]  # scoring ran over the fused ranking
     # Evidence page 30 came from the sparse arm; recall@10 sees it.

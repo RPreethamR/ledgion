@@ -14,9 +14,12 @@ takes the fusion as an injectable ``fuse`` callable (defaulting to
 ``reciprocal_rank_fusion``): tests pass a fake fuse to verify gathering, and a
 separate test pins that the real stub raises ``NotImplementedError``.
 
-No post-fusion truncation is applied: the fused list is the union of both arms,
-best-first, and the page-level metric cutoffs (recall@10, recall@k) do the
-truncation downstream, so hybrid and dense stay comparable at the same page depth.
+The fused ranking is truncated back to ``retrieval.top_k`` chunks, so hybrid is
+scored over the **same candidate budget as dense** (top_k in from each arm, top_k
+out). Otherwise fusing two top_k lists would hand up to ``2 * top_k`` candidates
+downstream, and hybrid's recall would rise simply because it draws from a pool twice
+dense's size — a bigger pool, not better retrieval. The fusion function returns the
+full fused union; ``HybridRetriever`` applies the cap.
 """
 
 from __future__ import annotations
@@ -47,10 +50,12 @@ def reciprocal_rank_fusion(
     * ``k`` is the RRF smoothing constant (``fusion.rrf_k``, default 60).
 
     RRF assigns each chunk the score ``sum(1 / (k + rank))`` over the lists it
-    appears in (rank 1-based). Return a single list of ``RetrievedChunk``,
-    **best-first** (highest fused score), each chunk appearing once, with ``score``
-    set to its fused RRF score. Break ties deterministically (e.g. by chunk_id) so
-    the ranking — and therefore ``results/<hash>.json`` — is reproducible.
+    appears in (rank 1-based). Return the **full** fused ranking — every distinct
+    chunk from either list, **best-first** (highest fused score), each appearing once,
+    with ``score`` set to its fused RRF score. Do **not** truncate here:
+    ``HybridRetriever`` caps the result at the ``top_k`` candidate budget, so this
+    function returns the whole union. Break ties deterministically (e.g. by chunk_id)
+    so the ranking — and therefore ``results/<hash>.json`` — is reproducible.
 
     (``fusion.dense_weight`` / ``fusion.sparse_weight`` exist in config for a later
     weighted-RRF ablation; plain RRF ignores them.)
@@ -97,7 +102,16 @@ class HybridRetriever:
         )
 
     def retrieve(self, query: str, *, top_k: int) -> list[RetrievedChunk]:
-        """Gather top_k from each arm and return the fused ranking, best-first."""
+        """Gather top_k from each arm, fuse, and return the top_k fused chunks.
+
+        The fused list is truncated back to ``top_k`` so hybrid is scored over the
+        **same candidate budget as dense** — top_k in from each arm, top_k out.
+        Without this, fusing two top_k lists would feed up to ``2 * top_k`` candidates
+        downstream, and any recall "gain" would just be a bigger pool, not better
+        retrieval. (Truncation is the retriever's job, not the fusion maths': the
+        fuse function returns the full fused union, best-first, and this caps it.)
+        """
         dense_ranked = self.dense.retrieve(query, top_k=top_k)
         sparse_ranked = self.sparse.retrieve(query, top_k=top_k)
-        return self.fuse(dense_ranked, sparse_ranked, self.rrf_k)
+        fused = self.fuse(dense_ranked, sparse_ranked, self.rrf_k)
+        return fused[:top_k]

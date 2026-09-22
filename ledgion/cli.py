@@ -192,6 +192,34 @@ def fixture(config: Path | None = _ConfigOption) -> None:
     )
 
 
+analyze_app = typer.Typer(
+    add_completion=False,
+    help="Post-hoc analysis over results/*.json. Read-only — changes nothing Tier 1 reports.",
+)
+app.add_typer(analyze_app, name="analyze")
+
+_AOption = typer.Option(..., "--a", help="Results file for system A (results/<hash>.json).")
+_BOption = typer.Option(..., "--b", help="Results file for system B (results/<hash>.json).")
+
+
+@analyze_app.command("complementarity")
+def analyze_complementarity(a: Path = _AOption, b: Path = _BOption) -> None:
+    """Classify every golden (qid, evidence page) pair as found by both / A only /
+    B only / neither, and report the union recall@K — the ceiling any fusion of these
+    two runs can reach. Stops if the recomputed recall@K doesn't match either file."""
+    from ledgion.eval import complementarity as comp
+    from ledgion.eval.runner import load_golden, load_report
+
+    a_report, b_report = load_report(a), load_report(b)
+    golden = load_golden()
+    try:
+        result = comp.analyze(golden, a_report, b_report)
+    except comp.ConsistencyError as exc:
+        typer.secho(str(exc), fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(comp.format_report(result, a_report, b_report))
+
+
 def main() -> None:
     app()
 
