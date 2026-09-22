@@ -33,8 +33,9 @@ flowchart TB
   Q -. "make fixture" .-> FR
 ```
 
-Retrieval is scored at **page level** (page numbers are stable across chunkers), so
-strategies stay comparable across ablations.
+Retrieval is scored on **(doc_id, page)** keys (page numbers are stable across
+chunkers), so strategies stay comparable across ablations and a right-page/wrong-filing
+match never counts as a hit.
 
 ## Baseline
 
@@ -44,13 +45,53 @@ or narrative (prose).
 
 | Group   |  n | hit@1 |  MRR | nDCG@10 | recall@10 | recall@50 |
 |:--------|---:|------:|-----:|--------:|----------:|----------:|
-| Overall | 30 | 0.133 | 0.263 |  0.300 |     0.500 |     0.817 |
-| Numeric | 16 | 0.188 | 0.305 |  0.330 |     0.531 |     0.938 |
-| Prose   | 14 | 0.071 | 0.216 |  0.265 |     0.464 |     0.679 |
+| Overall | 30 | 0.133 | 0.252 |  0.291 |     0.500 |     0.817 |
+| Numeric | 16 | 0.188 | 0.304 |  0.330 |     0.531 |     0.938 |
+| Prose   | 14 | 0.071 | 0.192 |  0.245 |     0.464 |     0.679 |
 
 **Read:** the evidence page is *found* 82% of the time (recall@50) but *ranked in the
 top 10* only 50% of the time — a ranking problem, not a finding problem. Closing that
-gap is the goal of the next ablations (hybrid BM25 retrieval, then reranking).
+gap is the goal of the ablations: hybrid BM25 (measured below), then reranking.
+
+## Hybrid retrieval: measured, not adopted
+
+Phase 6 added a BM25 sparse arm and Reciprocal Rank Fusion, then measured whether
+fusing it with dense retrieval helps — at an **equal 50-candidate budget** (hybrid
+returns the same number of candidates as dense, so any gain is retrieval quality, not
+a bigger pool). It barely does, so the default stays dense.
+
+**Complementarity (dense × sparse, per evidence page, depth 50).** Of 35 golden
+evidence pages, sparse finds exactly **one** that dense misses:
+
+|                  | in sparse | not in sparse |
+|:-----------------|----------:|--------------:|
+| **in dense**     |        11 |            16 |
+| **not in dense** |         1 |             7 |
+
+The union recall ceiling is 0.828 — barely above dense's 0.817 — and 7 pages are found
+by neither (a floor no fusion of these two can reach). So fusion can only re-rank what
+dense already retrieves; it cannot find materially more.
+
+**Weighted-RRF sweep (overall, `dense_weight=1.0`, `rrf_k=60`).**
+
+| Run                       | hit@1 |  MRR | nDCG@10 | recall@10 | recall@50 |
+|:--------------------------|------:|-----:|--------:|----------:|----------:|
+| dense (baseline)          | 0.133 | 0.252 | 0.291 |     0.500 |     0.817 |
+| hybrid · plain · sw1.0    | 0.167 | 0.229 | 0.236 |     0.383 |     0.650 |
+| hybrid · plain · sw0.5    | 0.133 | 0.231 | 0.258 |     0.467 |     0.817 |
+| hybrid · plain · sw0.25   | 0.167 | 0.265 | 0.280 |     0.467 |     0.817 |
+| hybrid · stopwords · sw1.0  | 0.167 | 0.241 | 0.262 |   0.417 |     0.667 |
+| hybrid · stopwords · sw0.5  | 0.167 | 0.255 | 0.273 |   0.433 |     0.817 |
+| hybrid · stopwords · sw0.25 | 0.200 | 0.288 | 0.305 |   0.450 |     0.817 |
+
+**Why measured, not adopted.** Equal-weight fusion (`sw=1.0`) actively *hurts* — sparse's
+noise evicts dense evidence pages from the shared 50-slot budget, dropping recall@50 to
+~0.65 — and only a low sparse weight (`sw ≤ 0.5`, where no sparse-only chunk can enter
+the top 50, so recall is preserved exactly) trades a small recall@10 dip for a small
+early-rank gain (best: stopwords · sw0.25, nDCG@10 +0.014, hit@1 +0.067). Those gains
+are marginal and ranking-only, so hybrid ships as a documented, reproducible ablation
+rather than the default — the honest next lever is reranking. See
+[`DECISIONS.md`](DECISIONS.MD) for the full analysis.
 
 ## CI gate
 

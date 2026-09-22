@@ -1,0 +1,101 @@
+# Experiment: hybrid_plain_sw0.25 — dense + plain (raw) BM25, weighted RRF.
+#
+# Weighted-RRF sweep member: dense_weight 1.0, sparse_weight 0.25, rrf_k 60,
+# sparse.remove_stopwords false. One knob varies across the sweep — sparse_weight.
+# Pre-registered: with sparse_weight <= 0.5 no sparse-only chunk can enter the
+# top-50 (0.5/(60+1) < 1/(60+50)), so recall@k must equal dense's exactly.
+#
+#   uv run ledgion eval --tier 1 --config config/experiments/hybrid_plain_sw0.25.yaml
+
+paths:
+  data_dir: data
+  pdf_dir: data/pdfs
+  financebench_dir: data/financebench
+  results_dir: results
+  cache_dir: .cache
+
+tickers:
+  Amcor: AMCR
+  AMD: AMD
+  American Express: AXP
+  Boeing: BA
+  PepsiCo: PEP
+
+torch:
+  num_threads: 4
+
+embedding:
+  model_id: BAAI/bge-base-en-v1.5
+  revision: a5beb1e3e68b9ab74eb54cfd186867f64f240e1a
+  device: cpu
+  batch_size: 32
+  normalize: true
+  max_seq_length: 512
+  query_instruction: "Represent this sentence for searching relevant passages:"
+
+reranker:
+  model_id: cross-encoder/ms-marco-MiniLM-L-6-v2
+  revision: 233902d25c440f23af6f7d6e94d2946bac0bee0a
+  device: cpu
+  top_n: 5
+
+sparse:
+  backend: rank_bm25
+  fastembed_model: Qdrant/bm25
+  lowercase: true
+  token_pattern: "[A-Za-z0-9]+"
+  remove_stopwords: false
+  k1: 1.5
+  b: 0.75
+  epsilon: 0.25
+
+chunk:
+  size: 448
+  overlap: 64
+  unit: tokens
+  respect_page_boundary: true
+
+retrieval:
+  top_k: 50
+  backend: hybrid
+
+fusion:
+  method: rrf
+  rrf_k: 60
+  dense_weight: 1.0
+  sparse_weight: 0.25
+
+qdrant:
+  mode: docker
+  url: http://localhost:6333
+  path: qdrant_storage
+  collection_name: ledgion_filings
+  prefer_grpc: false
+
+generation:
+  provider: gemini
+  model: gemini-3.8-flash
+  temperature: 0.0
+  max_output_tokens: 2048
+  api_key_env: GEMINI_API_KEY
+  thinking_budget: 0
+  max_retries: 5
+  retry_base_delay_s: 2.0
+
+tracing:
+  enabled: false
+  provider: langfuse
+  host: https://cloud.langfuse.com
+  public_key_env: LANGFUSE_PUBLIC_KEY
+  secret_key_env: LANGFUSE_SECRET_KEY
+
+eval:
+  tier: 1
+  ragas_enabled: false
+  judge_model: gemini-2.0-flash
+  metrics:
+    - recall@k
+    - recall@10
+    - ndcg@10
+    - mrr
+    - hit@1

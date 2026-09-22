@@ -1,15 +1,14 @@
-"""HybridRetriever scaffolding — candidate gathering around the user's fusion stub.
+"""HybridRetriever scaffolding — candidate gathering + budget cap around the fusion.
 
-The fusion maths (``reciprocal_rank_fusion``) is the user's to write and ships as a
-``NotImplementedError`` stub. These tests exercise everything *around* it: that the
-hybrid retriever pulls top_k from both arms and hands both rankings to the fusion,
-that an injected fuse lets the wiring run before the stub is filled in, and that the
-stub itself raises — so leaving it unimplemented never silently no-ops.
+The fusion maths (``reciprocal_rank_fusion``) is the user's; these tests exercise the
+scaffolding around it: that the hybrid retriever pulls top_k from both arms and hands
+both rankings (plus k and the arm weights) to the fusion, that the fused result is
+capped to the top_k candidate budget, and — the pre-registered property — that a small
+enough sparse_weight leaves dense's candidate set intact. The candidate-gathering and
+cap tests inject a fake fuse; the property test uses the real reciprocal_rank_fusion.
 """
 
 from __future__ import annotations
-
-import pytest
 
 from ledgion.interfaces import Chunk, RetrievedChunk
 from ledgion.retrieve.fusion import HybridRetriever, reciprocal_rank_fusion
@@ -54,22 +53,26 @@ def test_hybrid_pulls_from_both_sources():
 
     seen: dict = {}
 
-    def spy_fuse(dense_ranked, sparse_ranked, k):
+    def spy_fuse(dense_ranked, sparse_ranked, k, dense_weight=1.0, sparse_weight=1.0):
         seen["dense"] = list(dense_ranked)
         seen["sparse"] = list(sparse_ranked)
         seen["k"] = k
+        seen["weights"] = (dense_weight, sparse_weight)
         return list(dense_ranked) + list(sparse_ranked)
 
-    hybrid = HybridRetriever(dense=dense, sparse=sparse, rrf_k=60, fuse=spy_fuse)
+    hybrid = HybridRetriever(
+        dense=dense, sparse=sparse, rrf_k=60, dense_weight=1.0, sparse_weight=0.5, fuse=spy_fuse
+    )
     out = hybrid.retrieve("q", top_k=3)
 
     # Both arms were queried at the requested depth…
     assert dense.asked_top_k == 3
     assert sparse.asked_top_k == 3
-    # …and both rankings reached the fusion, with the configured k.
+    # …and both rankings, k, AND the configured arm weights reached the fusion.
     assert [rc.chunk.page_num for rc in seen["dense"]] == [10, 20, 30]
     assert [rc.chunk.page_num for rc in seen["sparse"]] == [30, 40, 50]
     assert seen["k"] == 60
+    assert seen["weights"] == (1.0, 0.5)
     # The retriever returns the fused ranking capped at the top_k budget.
     assert out == (seen["dense"] + seen["sparse"])[:3]
 
@@ -81,7 +84,7 @@ def test_hybrid_returns_exactly_top_k_chunks():
     dense = _FakeRetriever(_ranked([(i, 100 + i) for i in range(50)]))
     sparse = _FakeRetriever(_ranked([(1000 + i, 200 + i) for i in range(50)]))
 
-    def union_fuse(dense_ranked, sparse_ranked, k):
+    def union_fuse(dense_ranked, sparse_ranked, k, dense_weight=1.0, sparse_weight=1.0):
         # No dedup needed (disjoint); returns the full 100-chunk union, best-first.
         return list(dense_ranked) + list(sparse_ranked)
 
@@ -94,18 +97,33 @@ def test_hybrid_returns_exactly_top_k_chunks():
     assert out == (dense.retrieve("q", top_k=50) + sparse.retrieve("q", top_k=50))[:50]
 
 
-def test_stub_fusion_raises_not_implemented():
-    # The user's function is intentionally unwritten; it must raise, not no-op.
-    with pytest.raises(NotImplementedError):
-        reciprocal_rank_fusion([], [], 60)
-
-
-def test_scaffolding_survives_the_unimplemented_stub():
-    # Constructing the hybrid with the default (stub) fusion must not raise — the
-    # wiring is intact; only calling through the stub surfaces NotImplementedError.
-    dense = _FakeRetriever(_ranked([(1, 10)]))
-    sparse = _FakeRetriever(_ranked([(2, 20)]))
+def test_default_fuse_is_the_real_fusion_and_runs():
+    # The default fuse is the implemented reciprocal_rank_fusion; the hybrid path runs
+    # end to end and returns a budget-capped fused list.
+    dense = _FakeRetriever(_ranked([(1, 10), (2, 20)]))
+    sparse = _FakeRetriever(_ranked([(2, 20), (3, 30)]))
     hybrid = HybridRetriever(dense=dense, sparse=sparse, rrf_k=60)
+
     assert hybrid.fuse is reciprocal_rank_fusion
-    with pytest.raises(NotImplementedError):
-        hybrid.retrieve("q", top_k=1)
+    out = hybrid.retrieve("q", top_k=2)
+    assert len(out) == 2
+    assert all(isinstance(rc, RetrievedChunk) for rc in out)
+    # chunk 2 is in both arms, so it fuses highest and leads.
+    assert out[0].chunk.chunk_id == f"{2:016x}"
+
+
+def test_low_sparse_weight_preserves_dense_candidate_set():
+    # The pre-registered property, at unit scale, through the REAL fusion + budget cap:
+    # with dense_weight 1.0 and sparse_weight 0.5, no sparse-only chunk can outscore any
+    # dense chunk (0.5/(60+1) < 1/(60+50)), so the top-K fused SET equals dense's — which
+    # is exactly why recall@K (a set-at-depth-K metric) is unchanged by these weights.
+    k = 50
+    dense = _FakeRetriever(_ranked([(i, 100 + i) for i in range(k)]))
+    sparse = _FakeRetriever(_ranked([(1000 + i, 900 + i) for i in range(k)]))  # disjoint
+    hybrid = HybridRetriever(
+        dense=dense, sparse=sparse, rrf_k=60, dense_weight=1.0, sparse_weight=0.5
+    )
+
+    out = hybrid.retrieve("q", top_k=k)
+    dense_ids = {rc.chunk.chunk_id for rc in dense.retrieve("q", top_k=k)}
+    assert {rc.chunk.chunk_id for rc in out} == dense_ids  # sparse-only never displaces

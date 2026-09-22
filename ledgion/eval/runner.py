@@ -164,7 +164,7 @@ def format_compare(old: dict, new: dict) -> str:
 # Canonical column order for the ablation table; any extra metric a run carries is
 # appended after these. recall@k is the full-depth recall (retrieval.top_k).
 _METRIC_ORDER = ("hit@1", "mrr", "ndcg@10", "recall@10", "recall@k")
-_LABEL_WIDTH = 16
+_LABEL_WIDTH = 26
 _COL_WIDTH = 11
 
 
@@ -173,7 +173,18 @@ def _run_backend(report: dict) -> str:
 
 
 def _run_label(report: dict) -> str:
-    return f"{_run_backend(report)} {report.get('config_hash', '?')[:6]}"
+    """A row label that surfaces the ablation knobs, not just an opaque hash — so a
+    weight sweep reads as ``hybrid sw0.25 stop <hash>`` rather than six ``hybrid`` rows."""
+    cfg = report.get("config", {})
+    parts = [_run_backend(report)]
+    if _run_backend(report) == "hybrid":
+        sw = cfg.get("fusion", {}).get("sparse_weight")
+        if sw is not None:
+            parts.append(f"sw{sw}")
+    if cfg.get("sparse", {}).get("remove_stopwords"):
+        parts.append("stop")
+    parts.append(report.get("config_hash", "?")[:6])
+    return " ".join(parts)
 
 
 def _delta_cell(current: float, baseline: float) -> str:

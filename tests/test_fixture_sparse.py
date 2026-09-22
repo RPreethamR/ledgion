@@ -180,7 +180,7 @@ def test_offline_hybrid_runs_end_to_end_with_fake_fuse(tmp_path):
     dense = FixtureRetriever.from_config(cfg, fixtures_dir=tmp_path, golden=golden)
     sparse = FixtureSparseRetriever.from_config(cfg, fixtures_dir=tmp_path, golden=golden)
 
-    def fake_fuse(dense_ranked, sparse_ranked, k):
+    def fake_fuse(dense_ranked, sparse_ranked, k, dense_weight=1.0, sparse_weight=1.0):
         # Stand-in for the user's RRF: dense first, then sparse extras, deduped by id.
         seen: set[str] = set()
         merged = []
