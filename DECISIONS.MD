@@ -208,3 +208,83 @@ Decision: dense stays default. No hybrid row passes the recall@10
 gate. Below sw 0.55 the candidate set equals dense's, so under a
 reranker hybrid is identical to dense by construction.
 Hybrid code and sparse fixture kept; re-run at corpus scale.
+
+## Phase 7 — depth diagnostic (before reranking)
+Dense at top_k=200, 35 evidence pairs:
+  ranks 1-10: 17 | 11-50: 11 | 51-100: 3 | 101-200: 1 | absent: 3
+Depth 50 → 200 rescues 4 pairs. Keeping top_k=50; deeper pool
+isn't worth the reranker latency. Will report a k=100 row.
+
+Reranker ceiling is exact: 28/35 pairs are in the top 50.
+  recall@50 MUST stay .8167 — reranking reorders, never adds.
+  recall@10 can rise from .500 to at most .800.
+Pre-registered: large recall@10 gain, recall@50 unchanged.
+Any change to recall@50 means the pipeline is broken.
+
+Amex p96 is the evidence page for two questions: id_00720
+(prose) at rank 156, id_00723 (numeric) absent at 200. Same page,
+same index, same embedder — the difference is query phrasing
+alone. Strongest motivating case for Phase 9 query rewriting.
+
+Three pairs absent at depth 200 are a floor for bge-base with the
+question as written, not an absolute floor.
+
+## Phase 7 — result (two rerankers, measured)
+Metric semantics decided before running: score the FULL reordered
+top_k pool, not the served top_n=5 (DECISIONS above / interview note).
+recall@top_k is the pool-integrity invariant — reranking permutes,
+never adds. Held to the digit on every row:
+  top_k=50  recall@50 = .8167  (dense, +MiniLM, +bge, hybrid+MiniLM)
+  top_k=100 recall@k  = .8889  (dense_k100 and +MiniLM companion)
+No deviation → pipeline correct; the quality moves below are real.
+
+                       hit@1  mrr    ndcg@10 r@10   r@50   retr   rerank
+                                                          p50ms  p50ms
+  dense (baseline)     .1333  .2521  .2906   .5000  .8167    83     —
+  dense +MiniLM        .0333  .2033  .2624   .5167  .8167    88   4826
+  dense +bge           .1000  .2036  .2644   .5333  .8167    97  27375
+  dense_k100           .1333  .2533  .2906   .5000  .8500    83     —
+  dense_k100 +MiniLM   .0333  .1913  .2617   .5333  .8444   110  10860
+  hybrid +MiniLM       .0333  .2033  .2624   .5167  .8167   120   5668
+(30 questions, CPU 4-thread. rerank p95: MiniLM 5963, bge 30598.)
+
+Read:
+- No reranker beats dense on hit@1, mrr, or ndcg@10. Both DROP hit@1
+  (.133 → .033 MiniLM, → .100 bge). Reranking is net-negative here.
+- +bge is the ONLY row to beat baseline recall@10 (.5333 vs .5000) —
+  it rescues buried evidence into the top-10 — but costs ~27s/question
+  (~285x retrieval, ~5.7x MiniLM). Not worth adopting.
+- hybrid+MiniLM == dense+MiniLM on every metric. Confirms sw0.25 fused
+  pool = dense's pool; reranking the same pool gives the same answer,
+  for ~0.8s more (the BM25 arm).
+- k100 deepens recall (r@k .8889, r@50 rises) but hit@1 unchanged at
+  .033 and rerank cost ~2.25x (linear in pool size).
+
+Why hit@1 collapses (diagnostic, not truncation):
+- Combined (query+chunk) tokens rarely exceed the 512 cap — MiniLM
+  tokenizer: 34/1500 pairs over, by ≤25 tokens. 3 of the 4 dense-rank-1
+  evidence pages pushed out fit; the 1 truncated lost 13 tail tokens
+  with its statement header intact. Truncation is NOT the cause.
+- Domain mismatch. On all 4 hit@1 regressions the CE promoted a prose
+  MD&A page or a different summary statement over the numeric
+  statement/notes holding the answer. MS-MARCO-trained cross-encoders
+  reward passages that lexically restate the question; 10-K evidence is
+  a dense table whose header does not.
+
+Score distributions (1500 pairs, top-50 pool; NOTE different scales —
+MiniLM raw logits, bge sigmoid probabilities, its native activation):
+  MiniLM  median -6.96, 3.6% > 0, evidence-vs-non mean sep +1.93 logit
+  bge     median 0.004, max 0.994, evidence mean 2.7x non (0.178/0.067)
+MiniLM sits in a flat low-confidence negative band → ordering among
+near-ties is noise. bge has real dynamic range and separates evidence
+better — yet its sharper confidence still doesn't put the right page
+at rank 1 (hit@1 .100 < dense .133).
+
+bge-reranker-base is XLM-RoBERTa, 512-token cap (NOT 8192; that's
+bge-reranker-v2-m3) — no max-length handling differs from MiniLM.
+Frozen scores keyed by reranker revision so the two models can't share
+a cache; fixture holds both (+12.3 KiB).
+
+Decision: dense stays default, no reranker adopted. Reranking code +
+both frozen score sets kept for re-measurement at corpus scale, where
+the cross-encoder has more to reorder and the domain-mismatch may ease.

@@ -74,13 +74,37 @@ class EmbeddingConfig(BaseModel):
     query_instruction: str = "Represent this sentence for searching relevant passages:"
 
 
+class RerankerRef(BaseModel):
+    """A pinned (model_id, revision) reference to a reranker.
+
+    Used for ``RerankerConfig.compare``: extra rerankers whose scores ``make fixture``
+    freezes into the *same* rerank_scores.npz alongside the active model, so two
+    reranker models can be compared offline. Each carries its own pinned revision;
+    the frozen scores are keyed on it, so no two models can share cached scores.
+    """
+
+    model_id: str
+    revision: str | None = None
+
+
 class RerankerConfig(BaseModel):
     model_id: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
-    # Pinned commit SHA (see EmbeddingConfig). Wired into CrossEncoder(revision=...)
-    # when the reranker lands in Phase 3; pinned now so config is stable meanwhile.
+    # Pinned commit SHA (see EmbeddingConfig). Wired into CrossEncoder(revision=...);
+    # folded into the fixture manifest so a model change can never silently reuse
+    # stale frozen scores. The reranker refuses to load if this is None, exactly like
+    # the embedder — a pin nothing reads is worse than no pin.
     revision: str | None = "233902d25c440f23af6f7d6e94d2946bac0bee0a"
     device: str = "cpu"
-    top_n: int = 5  # rerank_top_n: how many survive reranking
+    # Off by default so default.yaml stays the dense-only baseline; the rerank
+    # experiments flip this to true. When true, the eval pipeline applies reranking
+    # as a stage AFTER retrieval (it is not a Retriever) — see runner._build_reranker.
+    enabled: bool = False
+    batch_size: int = 32  # cross-encoder scoring batch (CPU); an ablation knob
+    top_n: int = 5  # rerank_top_n: how many survive reranking into the SERVING context
+    # Extra rerankers whose scores `make fixture` freezes alongside the active model,
+    # so a second model can be scored offline for comparison. Runtime is unaffected —
+    # a run only ever uses model_id/revision above; this list only widens the fixture.
+    compare: list[RerankerRef] = Field(default_factory=list)
 
 
 class SparseConfig(BaseModel):

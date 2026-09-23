@@ -16,15 +16,21 @@ the offline hybrid path replay:
   Depth is fixed (not tied to retrieval.top_k) so one fixture serves any top_k up
   to that depth; the offline sparse retriever truncates at runtime. No chunk text
   and no full BM25 index ship to CI — only these frozen per-query rankings.
+* ``rerank_scores.npz`` — per golden qid, the cross-encoder score for every
+  candidate chunk_id in that question's dense top-STORED_DEPTH pool, computed live
+  by the real reranker. Lets a reranked run score offline (no model) and reorder
+  identically to the live path; a candidate outside this frozen pool trips
+  FixtureReranker's loud missing-score guard.
 * ``manifest.json`` — provenance: the embedding model_id + revision, the chunk
-  count, the golden qids, the source git SHA, a timestamp, AND a ``sparse`` block
-  (backend, tokeniser settings, BM25 parameters, stored depth, and a corpus
-  fingerprint) that the sparse/hybrid fixture guard checks against the config.
+  count, the golden qids, the source git SHA, a timestamp, a ``sparse`` block
+  (backend, tokeniser settings, BM25 parameters, stored depth, corpus fingerprint),
+  AND a ``reranker`` block (model_id, revision, candidate depth, corpus fingerprint)
+  that the sparse/hybrid and rerank fixture guards check against the config.
 
-Dense and sparse artifacts are regenerated **together, atomically** (computed from
-one corpus scroll, staged in a temp dir, then moved into place) so they can never
-drift apart — the corpus fingerprint that guards the sparse path is only meaningful
-if the sparse rankings and the dense index describe the same corpus.
+Dense, sparse, and rerank artifacts are regenerated **together, atomically**
+(computed from one corpus scroll, staged in a temp dir, then moved into place) so
+they can never drift apart — the corpus fingerprint that guards the sparse and
+rerank paths is only meaningful if all three artifacts describe the same corpus.
 
 The ``.npz`` files are written deterministically (chunks sorted by chunk_id,
 queries/qids sorted by qid) so regenerating on unchanged inputs yields identical
@@ -174,16 +180,98 @@ def _write_sparse_rankings(
     return path, depth
 
 
+def _write_rerank_scores(
+    cfg: Settings, records: Sequence[dict], golden: Sequence[dict], out_dir: Path
+) -> tuple[Path, int, list[dict]]:
+    """Freeze the cross-encoder score of every candidate in each golden qid's pool, for
+    the active reranker **and** every model in ``reranker.compare``.
+
+    The pool is the **dense top-``depth``** set (depth = STORED_DEPTH), shared across
+    all models: parity between the live and fixture dense retrievers is already
+    established (Phase 5), and at ``sparse_weight <= 0.5`` the fused hybrid top-50 is a
+    reordering of dense's top-50, so the dense top-100 pool contains every candidate any
+    reranked config (dense@50, dense@100, hybrid@50) can surface. A chunk outside it
+    trips FixtureReranker's missing-score guard — exactly the "run make fixture" signal.
+
+    Scores are stored **keyed by reranker revision** ([n_models, n_qids, depth]) so
+    several models coexist and none can borrow another's scores. Runs live (docker
+    Qdrant + each cross-encoder — MiniLM ~80MB, bge-reranker-base ~1.1GB), scoring
+    depth×|golden| pairs *per model* — the slow part of `make fixture`. Each qid's pool
+    is sorted by chunk_id so the archive is byte-deterministic regardless of retrieval
+    order (the reranker rebuilds a dict at load, so order never affects the result).
+
+    Returns the path, the depth, and the list of frozen ``{model_id, revision}`` (for
+    the manifest guard)."""
+    from ledgion.retrieve.dense import DenseRetriever
+    from ledgion.retrieve.fixture import STORED_DEPTH
+    from ledgion.retrieve.rerank import CrossEncoderReranker
+
+    depth = min(STORED_DEPTH, len(records))
+    dense = DenseRetriever.from_config(cfg)
+
+    # Models to freeze: the active reranker first, then each compare model, deduped by
+    # (model_id, revision) so listing the active model again is harmless.
+    refs: list[tuple[str, str | None]] = [(cfg.reranker.model_id, cfg.reranker.revision)]
+    for r in cfg.reranker.compare:
+        if (r.model_id, r.revision) not in refs:
+            refs.append((r.model_id, r.revision))
+
+    rows = sorted(golden, key=lambda r: r["qid"])
+    qids = [row["qid"] for row in rows]
+
+    # Build each qid's pool ONCE (dense top-depth), sorted by chunk_id — shared by all
+    # models, so the stored chunk_ids are model-independent and deterministic.
+    pool_ids: list[list[str]] = []
+    pool_texts: list[list[str]] = []
+    for row in rows:
+        pool = dense.retrieve(row["question"], top_k=depth)
+        pairs = sorted(((rc.chunk.chunk_id, rc.chunk.text) for rc in pool), key=lambda p: p[0])
+        pool_ids.append([cid for cid, _ in pairs])
+        pool_texts.append([text for _, text in pairs])
+
+    # Score each model over every qid's pool; model_scores[m][i] aligns to pool_ids[i].
+    model_scores: list[list[list[float]]] = []
+    models: list[dict] = []
+    for model_id, revision in refs:
+        reranker = CrossEncoderReranker(
+            model_id=model_id,
+            revision=revision,
+            device=cfg.reranker.device,
+            batch_size=cfg.reranker.batch_size,
+            num_threads=cfg.torch.num_threads,
+        )
+        model_scores.append(
+            [
+                reranker.score(row["question"], texts)
+                for row, texts in zip(rows, pool_texts, strict=True)
+            ]
+        )
+        models.append({"model_id": model_id, "revision": revision})
+
+    path = out_dir / "rerank_scores.npz"
+    np.savez(
+        path,
+        qids=np.array(qids),
+        chunk_ids=np.array(pool_ids),                       # [n_qids, depth]
+        revisions=np.array([rev for _, rev in refs]),       # [n_models]
+        scores=np.array(model_scores, dtype=np.float32),    # [n_models, n_qids, depth]
+    )
+    return path, depth, models
+
+
 def _write_manifest(
     cfg: Settings,
     golden: Sequence[dict],
     records: Sequence[dict],
     stored_depth: int,
+    rerank_depth: int,
+    rerank_models: list[dict],
     out_dir: Path,
 ) -> Path:
     from ledgion.eval.runner import git_sha
     from ledgion.retrieve.sparse import bm25_params, corpus_fingerprint, tokenizer_config
 
+    fingerprint = corpus_fingerprint([r["chunk_id"] for r in records])
     manifest = {
         "embedding": {
             "model_id": cfg.embedding.model_id,
@@ -199,7 +287,16 @@ def _write_manifest(
             "tokenizer": tokenizer_config(cfg),
             "bm25": bm25_params(cfg),
             "stored_depth": stored_depth,
-            "corpus_fingerprint": corpus_fingerprint([r["chunk_id"] for r in records]),
+            "corpus_fingerprint": fingerprint,
+        },
+        # The reranker fixture's provenance — the rerank fixture guard checks that the
+        # configured (model_id, revision) is among `models` (which keys the frozen
+        # scores to a model version) and the corpus fingerprint. candidate_depth is the
+        # pool depth scores were frozen at; models lists every frozen reranker.
+        "reranker": {
+            "candidate_depth": rerank_depth,
+            "corpus_fingerprint": fingerprint,
+            "models": rerank_models,
         },
         "source_git_sha": git_sha(),
         "generated_at": dt.datetime.now(dt.UTC).isoformat(timespec="seconds"),
@@ -239,9 +336,16 @@ def generate_fixtures(
         _write_index(records, staging)
         _write_query_vectors(cfg, golden, staging)
         _, depth = _write_sparse_rankings(cfg, records, golden, staging)
-        _write_manifest(cfg, golden, records, depth, staging)
+        _, rerank_depth, rerank_models = _write_rerank_scores(cfg, records, golden, staging)
+        _write_manifest(cfg, golden, records, depth, rerank_depth, rerank_models, staging)
 
-        names = ["index.npz", "query_vectors.npz", "sparse_rankings.npz", "manifest.json"]
+        names = [
+            "index.npz",
+            "query_vectors.npz",
+            "sparse_rankings.npz",
+            "rerank_scores.npz",
+            "manifest.json",
+        ]
         for name in names:
             os.replace(staging / name, out_dir / name)
     finally:
@@ -252,6 +356,8 @@ def generate_fixtures(
         "chunk_count": len(records),
         "query_count": len(golden),
         "stored_depth": depth,
+        "rerank_depth": rerank_depth,
+        "rerank_models": rerank_models,
         "out_dir": str(out_dir),
         "sizes": sizes,
         "total_bytes": sum(sizes.values()),

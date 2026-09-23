@@ -4,7 +4,7 @@
     "model_id": "BAAI/bge-base-en-v1.5",
     "revision": "a5beb1e3e68b9ab74eb54cfd186867f64f240e1a"
   },
-  "generated_at": "2026-09-20T22:59:54+00:00",
+  "generated_at": "2026-09-23T01:47:03+00:00",
   "golden_qids": [
     "financebench_id_00222",
     "financebench_id_00464",
@@ -37,5 +37,35 @@
     "financebench_id_03620",
     "financebench_id_04481"
   ],
-  "source_git_sha": "d845388e845b6c28f5eeab345aeb27464925c260"
+  "reranker": {
+    "candidate_depth": 100,
+    "corpus_fingerprint": "4a1f0a181ceaca2af3c5afa9980219496fec1e7930a67641f657e55e83c83523",
+    "models": [
+      {
+        "model_id": "cross-encoder/ms-marco-MiniLM-L-6-v2",
+        "revision": "233902d25c440f23af6f7d6e94d2946bac0bee0a"
+      },
+      {
+        "model_id": "BAAI/bge-reranker-base",
+        "revision": "2cfc18c9415c912f9d8155881c133215df768a70"
+      }
+    ]
+  },
+  "source_git_sha": "900b713db43d9794e78fbcf6a5c2047ab8972911",
+  "sparse": {
+    "backend": "rank_bm25",
+    "bm25": {
+      "b": 0.75,
+      "epsilon": 0.25,
+      "k1": 1.5
+    },
+    "corpus_fingerprint": "4a1f0a181ceaca2af3c5afa9980219496fec1e7930a67641f657e55e83c83523",
+    "stored_depth": 100,
+    "tokenizer": {
+      "lowercase": true,
+      "remove_stopwords": false,
+      "stopwords_sha256": null,
+      "token_pattern": "[A-Za-z0-9]+"
+    }
+  }
 }

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import time
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -90,11 +91,19 @@ def build_report(
     tier: int,
     tier1_result: dict,
     tier2_result: dict | None = None,
+    latency: dict | None = None,
 ) -> dict:
     """Assemble the full results object: metrics + every provenance field.
 
     Pure assembly (no retrieval), so it is unit-testable from a fabricated
     ``tier1_result``.
+
+    ``latency`` (retrieval/rerank p50/p95) is included only when it was measured —
+    i.e. on a live, model-backed run. The offline "fixture" path measures nothing
+    (its timings would be meaningless dict lookups) so its report carries no
+    ``latency`` block and stays byte-identical across re-runs, exactly as before;
+    the byte-identical guarantee is scoped to everything *except* this block, since
+    wall-clock can't be deterministic.
     """
     report = {
         "tier": tier,
@@ -106,6 +115,8 @@ def build_report(
         "results": tier1_result["results"],
         "config": cfg.model_dump(mode="json"),
     }
+    if latency is not None:
+        report["latency"] = latency
     if tier2_result is not None:
         report["tier2"] = tier2_result
     return report
@@ -162,8 +173,10 @@ def format_compare(old: dict, new: dict) -> str:
 # -- ablation table (many runs at once) --------------------------------------
 
 # Canonical column order for the ablation table; any extra metric a run carries is
-# appended after these. recall@k is the full-depth recall (retrieval.top_k).
-_METRIC_ORDER = ("hit@1", "mrr", "ndcg@10", "recall@10", "recall@k")
+# appended after these. recall@k is the full-depth recall (retrieval.top_k); recall@50
+# is a fixed-cutoff column comparable across configs (a pool-integrity invariant only
+# for the top_k=50 rows — see the Phase 7 note in DECISIONS.md).
+_METRIC_ORDER = ("hit@1", "mrr", "ndcg@10", "recall@10", "recall@50", "recall@k")
 _LABEL_WIDTH = 26
 _COL_WIDTH = 11
 
@@ -174,7 +187,8 @@ def _run_backend(report: dict) -> str:
 
 def _run_label(report: dict) -> str:
     """A row label that surfaces the ablation knobs, not just an opaque hash — so a
-    weight sweep reads as ``hybrid sw0.25 stop <hash>`` rather than six ``hybrid`` rows."""
+    weight sweep reads as ``hybrid sw0.25 stop <hash>`` rather than six ``hybrid`` rows,
+    and a reranked deeper-pool run reads as ``dense rerank k100 <hash>``."""
     cfg = report.get("config", {})
     parts = [_run_backend(report)]
     if _run_backend(report) == "hybrid":
@@ -183,6 +197,13 @@ def _run_label(report: dict) -> str:
             parts.append(f"sw{sw}")
     if cfg.get("sparse", {}).get("remove_stopwords"):
         parts.append("stop")
+    if cfg.get("reranker", {}).get("enabled"):
+        parts.append("rerank")
+    # top_k=50 is the baseline pool depth; only surface it when a run deepens it,
+    # so Phase-6 labels stay unchanged and dense_rerank_k100 is legible.
+    top_k = cfg.get("retrieval", {}).get("top_k")
+    if top_k is not None and top_k != 50:
+        parts.append(f"k{top_k}")
     parts.append(report.get("config_hash", "?")[:6])
     return " ".join(parts)
 
@@ -235,7 +256,50 @@ def format_ablation(reports: Sequence[dict]) -> str:
                     _delta_cell(group_metrics.get(s, 0.0), base_group.get(s, 0.0)) for s in specs
                 )
                 lines.append(f"{'  delta':<{_LABEL_WIDTH}}{deltas}")
+
+    lines += _format_latency_section(reports)
     return "\n".join(lines)
+
+
+# -- latency (the other side of the rerank trade) ----------------------------
+
+_LATENCY_COLS = ("retr p50", "retr p95", "rrank p50", "rrank p95")
+
+
+def _latency_cell(stage: dict | None, key: str) -> str:
+    """One p50/p95 cell; a dash when the run didn't measure that stage (e.g. no
+    reranker, or the offline fixture path which measures nothing)."""
+    value = (stage or {}).get(key)
+    if value is None:
+        return f"{'-':>{_COL_WIDTH}}"
+    return f"{value:>{_COL_WIDTH}.2f}"
+
+
+def _format_latency_section(reports: Sequence[dict]) -> list[str]:
+    """A per-run latency table (ms): retrieval and rerank p50/p95 side by side, so the
+    ablation shows both halves of a reranker's quality-for-latency trade. Rendered only
+    if at least one run carries a measured ``latency`` block; runs without one are
+    skipped (rather than shown as zero)."""
+    if not any(r.get("latency") for r in reports):
+        return []
+    lines = [
+        "",
+        f"{'latency (ms)':<{_LABEL_WIDTH}}" + "".join(f"{c:>{_COL_WIDTH}}" for c in _LATENCY_COLS),
+        "-" * (_LABEL_WIDTH + _COL_WIDTH * len(_LATENCY_COLS)),
+    ]
+    for report in reports:
+        latency = report.get("latency")
+        if not latency:
+            continue
+        retrieval, rerank = latency.get("retrieval"), latency.get("rerank")
+        cells = (
+            _latency_cell(retrieval, "p50")
+            + _latency_cell(retrieval, "p95")
+            + _latency_cell(rerank, "p50")
+            + _latency_cell(rerank, "p95")
+        )
+        lines.append(f"{_run_label(report):<{_LABEL_WIDTH}}{cells}")
+    return lines
 
 
 # -- end-to-end run (the real, model-backed path) ----------------------------
@@ -270,17 +334,111 @@ def _build_retriever(cfg: Settings):
     return DenseRetriever.from_config(cfg)
 
 
+def _build_reranker(cfg: Settings):
+    """Build the reranking stage when ``reranker.enabled``, else ``None``.
+
+    Reranking is a stage applied *after* retrieval, not a Retriever, so the runner
+    composes it around ``_build_retriever`` rather than selecting it as a backend.
+    The offline ``"fixture"`` backend replays frozen cross-encoder scores (no model,
+    no torch — the CI path); every model-backed backend uses the live CrossEncoder.
+    """
+    if not cfg.reranker.enabled:
+        return None
+    if cfg.retrieval.backend == "fixture":
+        from ledgion.retrieve.fixture import FixtureReranker
+
+        return FixtureReranker.from_config(cfg)
+
+    from ledgion.retrieve.rerank import CrossEncoderReranker
+
+    return CrossEncoderReranker.from_config(cfg)
+
+
+# -- latency measurement (live path only) ------------------------------------
+
+
+class _TimedRetriever:
+    """Wraps a retriever to record each ``retrieve`` call's wall-clock (ms), in order."""
+
+    def __init__(self, inner) -> None:
+        self._inner = inner
+        self.durations_ms: list[float] = []
+
+    def retrieve(self, query: str, *, top_k: int):
+        start = time.perf_counter()
+        out = self._inner.retrieve(query, top_k=top_k)
+        self.durations_ms.append((time.perf_counter() - start) * 1000.0)
+        return out
+
+
+class _TimedReranker:
+    """Wraps a reranker to record each ``rerank`` call's wall-clock (ms), in order."""
+
+    def __init__(self, inner) -> None:
+        self._inner = inner
+        self.durations_ms: list[float] = []
+
+    def rerank(self, query: str, candidates, *, top_n: int):
+        start = time.perf_counter()
+        out = self._inner.rerank(query, candidates, top_n=top_n)
+        self.durations_ms.append((time.perf_counter() - start) * 1000.0)
+        return out
+
+
+def _percentiles(durations_ms: Sequence[float]) -> dict | None:
+    """p50/p95 (ms, 2dp) + sample count for one stage; ``None`` if nothing was timed."""
+    if not durations_ms:
+        return None
+    import numpy as np
+
+    p50, p95 = (float(x) for x in np.percentile(np.asarray(durations_ms, dtype=float), [50, 95]))
+    return {"p50": round(p50, 2), "p95": round(p95, 2), "n": len(durations_ms)}
+
+
+def _latency_block(retrieval_ms: Sequence[float], rerank_ms: Sequence[float]) -> dict:
+    """Assemble the report's ``latency`` block from per-question stage timings."""
+    block: dict = {"unit": "ms", "retrieval": _percentiles(retrieval_ms)}
+    rerank = _percentiles(rerank_ms)
+    if rerank is not None:
+        block["rerank"] = rerank
+    return block
+
+
 def run(cfg: Settings, *, tier: int, out_dir: Path | None = None) -> Path:
     """Run the eval end-to-end and write the results file. Returns its path."""
     golden = load_golden()
     retriever = _build_retriever(cfg)
+    reranker = _build_reranker(cfg)
+
+    # Latency is meaningful only on the live, model-backed path — the fixture backend
+    # replays precomputed vectors/scores, so its timings would measure dict lookups.
+    timed_retriever = timed_reranker = None
+    if cfg.retrieval.backend != "fixture" and golden:
+        # Warm up the lazy model loads once (untimed) so p50/p95 reflect steady-state
+        # latency rather than a one-off cold start on the first golden question.
+        warm_q = golden[0]["question"]
+        warm = retriever.retrieve(warm_q, top_k=cfg.retrieval.top_k)
+        if reranker is not None:
+            reranker.rerank(warm_q, warm, top_n=cfg.retrieval.top_k)
+        timed_retriever = _TimedRetriever(retriever)
+        retriever = timed_retriever
+        if reranker is not None:
+            timed_reranker = _TimedReranker(reranker)
+            reranker = timed_reranker
 
     tier1_result = run_tier1(
         golden,
         retriever,
         top_k=cfg.retrieval.top_k,
         metric_specs=cfg.eval.metrics,
+        reranker=reranker,
     )
+
+    # Snapshot latency from the Tier-1 loop before any Tier-2 retrieval adds calls.
+    latency = None
+    if timed_retriever is not None:
+        rerank_ms = timed_reranker.durations_ms if timed_reranker is not None else []
+        latency = _latency_block(timed_retriever.durations_ms, rerank_ms)
 
     tier2_result = None
     if tier == 2:
@@ -302,7 +460,13 @@ def run(cfg: Settings, *, tier: int, out_dir: Path | None = None) -> Path:
             config_hash=config_hash(cfg),
         )
 
-    report = build_report(cfg, tier=tier, tier1_result=tier1_result, tier2_result=tier2_result)
+    report = build_report(
+        cfg,
+        tier=tier,
+        tier1_result=tier1_result,
+        tier2_result=tier2_result,
+        latency=latency,
+    )
     return write_report(report, out_dir=out_dir)
 
 

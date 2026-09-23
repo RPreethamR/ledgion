@@ -32,7 +32,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 from ledgion.eval import metrics
-from ledgion.interfaces import RetrievedChunk, Retriever
+from ledgion.interfaces import Reranker, RetrievedChunk, Retriever
 
 # Answer-type groups reported alongside "overall". Fixed (not derived from the
 # data) so the results schema is stable across runs even when a group is empty.
@@ -132,16 +132,28 @@ def run_tier1(
     top_k: int,
     metric_specs: Sequence[str],
     default_k: int | None = None,
+    reranker: Reranker | None = None,
 ) -> dict:
-    """Run retrieval + page-level scoring over every golden row.
+    """Run retrieval (+ optional reranking) + page-level scoring over every golden row.
 
     Returns ``{"results": [per-question…], "metrics": {overall/numeric/prose/counts}}``.
     ``default_k`` (for a literal ``recall@k``) defaults to ``top_k``.
+
+    ``reranker`` is a *stage applied after retrieval*, not a Retriever: the retriever
+    arm (dense/hybrid) doesn't know it exists, and the reranker doesn't know which arm
+    produced the pool. When present, the **whole** ``top_k`` pool is reordered (``top_n
+    = top_k``), not trimmed to ``reranker.top_n`` — so recall@k stays scored over the
+    same candidate set as dense and only the *order* differs (the pool-integrity
+    property check; ``reranker.top_n`` trims only the serving context, never scoring —
+    see DECISIONS.md Phase 7). Scoring below is byte-for-byte the dense path: it just
+    receives a reordered list.
     """
     default_k = top_k if default_k is None else default_k
     per_question: list[dict] = []
     for row in golden_rows:
         retrieved = retriever.retrieve(row["question"], top_k=top_k)
+        if reranker is not None:
+            retrieved = reranker.rerank(row["question"], retrieved, top_n=top_k)
         ranked = collapse_to_pages(retrieved)
         relevant = {(row["doc_id"], page) for page in row["evidence_pages"]}
         per_question.append(
