@@ -1,0 +1,108 @@
+# Experiment: dense_rerank_bge — dense at top_k=50 + BAAI/bge-reranker-base.
+#
+# Same shape as dense_rerank (dense top_k=50, reranking as a post-retrieval stage);
+# the only knob that changes is the reranker model: bge-reranker-base (XLM-RoBERTa,
+# 278M params) instead of ms-marco-MiniLM-L-6-v2 (22M). Both cap at 512 tokens, so no
+# max-length handling differs. The comparison — MiniLM vs a 12x-larger reranker on the
+# same pool — is the point of this run.
+#
+# Metric semantics unchanged (DECISIONS.md Phase 7): the whole top_k pool is reranked
+# and scored, so recall@k (=recall@50) is the pool-integrity invariant .816667.
+#
+#   uv run ledgion eval --tier 1 --config config/experiments/dense_rerank_bge.yaml
+
+paths:
+  data_dir: data
+  pdf_dir: data/pdfs
+  financebench_dir: data/financebench
+  results_dir: results
+  cache_dir: .cache
+
+tickers:
+  Amcor: AMCR
+  AMD: AMD
+  American Express: AXP
+  Boeing: BA
+  PepsiCo: PEP
+
+torch:
+  num_threads: 4
+
+embedding:
+  model_id: BAAI/bge-base-en-v1.5
+  revision: a5beb1e3e68b9ab74eb54cfd186867f64f240e1a
+  device: cpu
+  batch_size: 32
+  normalize: true
+  max_seq_length: 512
+  query_instruction: "Represent this sentence for searching relevant passages:"
+
+reranker:
+  model_id: BAAI/bge-reranker-base
+  revision: 2cfc18c9415c912f9d8155881c133215df768a70   # pinned commit; XLM-RoBERTa, 512-token cap
+  device: cpu
+  enabled: true
+  batch_size: 32
+  top_n: 5
+
+sparse:
+  backend: rank_bm25
+  fastembed_model: Qdrant/bm25
+  lowercase: true
+  token_pattern: "[A-Za-z0-9]+"
+  remove_stopwords: false
+  k1: 1.5
+  b: 0.75
+  epsilon: 0.25
+
+chunk:
+  size: 448
+  overlap: 64
+  unit: tokens
+  respect_page_boundary: true
+
+retrieval:
+  top_k: 50
+  backend: dense
+
+fusion:
+  method: rrf
+  rrf_k: 60
+  dense_weight: 1.0
+  sparse_weight: 1.0
+
+qdrant:
+  mode: docker
+  url: http://localhost:6333
+  path: qdrant_storage
+  collection_name: ledgion_filings
+  prefer_grpc: false
+
+generation:
+  provider: gemini
+  model: gemini-3.8-flash
+  temperature: 0.0
+  max_output_tokens: 2048
+  api_key_env: GEMINI_API_KEY
+  thinking_budget: 0
+  max_retries: 5
+  retry_base_delay_s: 2.0
+
+tracing:
+  enabled: false
+  provider: langfuse
+  host: https://cloud.langfuse.com
+  public_key_env: LANGFUSE_PUBLIC_KEY
+  secret_key_env: LANGFUSE_SECRET_KEY
+
+eval:
+  tier: 1
+  ragas_enabled: false
+  judge_model: gemini-2.0-flash
+  metrics:
+    - recall@k
+    - recall@10
+    - recall@50
+    - ndcg@10
+    - mrr
+    - hit@1

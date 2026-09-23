@@ -186,12 +186,16 @@ def fixture(config: Path | None = _ConfigOption) -> None:
     from ledgion.eval.fixtures import generate_fixtures
 
     summary = generate_fixtures(cfg)
+    models = summary["rerank_models"]
     typer.echo(
         f"wrote {summary['chunk_count']} chunk vectors, "
         f"{summary['query_count']} query vectors, "
         f"sparse rankings at depth {summary['stored_depth']}, "
-        f"rerank scores at depth {summary['rerank_depth']}  ->  {summary['out_dir']}"
+        f"rerank scores at depth {summary['rerank_depth']} for {len(models)} model(s)"
+        f"  ->  {summary['out_dir']}"
     )
+    for m in models:
+        typer.echo(f"    reranker: {m['model_id']} @ {m['revision']}")
     sizes = summary["sizes"]
     for name in (
         "index.npz",

@@ -47,6 +47,12 @@ reranker:
   enabled: false            # default stays dense-only; the rerank experiments flip this
   batch_size: 32            # cross-encoder scoring batch (CPU)
   top_n: 5                  # rerank_top_n: how many survive into the serving context
+  # Extra rerankers `make fixture` also freezes (keyed by revision) so both models can
+  # be compared offline. bge-reranker-base is XLM-RoBERTa (278M) — also caps at 512
+  # tokens, so no max-length handling differs from MiniLM.
+  compare:
+    - model_id: BAAI/bge-reranker-base
+      revision: 2cfc18c9415c912f9d8155881c133215df768a70
 
 sparse:
   backend: rank_bm25        # rank_bm25 first, then fastembed into Qdrant

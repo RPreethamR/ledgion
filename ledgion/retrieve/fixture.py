@@ -396,10 +396,12 @@ class FixtureReranker:
     ``fixtures/rerank_scores.npz`` holds, per golden qid, the cross-encoder score for
     every candidate chunk_id in that question's pool — frozen once, locally, by
     ``make fixture`` at ``candidate_depth`` (the dense top-``depth`` pool, which
-    contains every reranked config's pool). This stage maps the question to its qid,
-    looks the frozen scores up, and hands them to ``rerank_by_scores`` — the *same*
-    reordering primitive the live ``CrossEncoderReranker`` uses, so the two produce
-    identical rankings by construction.
+    contains every reranked config's pool). Scores are stored **keyed by reranker
+    revision**, so more than one model (e.g. MiniLM and bge-reranker-base) can be
+    frozen side by side and compared offline; a run selects only its own model's
+    block. This stage maps the question to its qid, looks the frozen scores up, and
+    hands them to ``rerank_by_scores`` — the *same* reordering primitive the live
+    ``CrossEncoderReranker`` uses, so the two produce identical rankings by construction.
 
     ⚠️ If a candidate has no frozen score it **raises** (run make fixture). It never
     skips the candidate and never defaults the score to zero or the minimum: a PR that
@@ -412,10 +414,11 @@ class FixtureReranker:
     on any):
 
     1. the manifest carries a ``reranker`` block (fixtures were built with reranking);
-    2. its model_id and revision equal the resolved config's — the lookup is keyed on
-       the revision, so changing the model can't reuse stale frozen scores;
+    2. the resolved config's (model_id, revision) is among the frozen ``models`` — the
+       scores are keyed on the revision, so two models can never share cached scores
+       and a config whose model isn't frozen fails rather than reusing another's;
     3. its corpus fingerprint equals the live one recomputed from ``index.npz``;
-    4. every golden qid has frozen scores.
+    4. every golden qid has frozen scores for the selected model.
     """
 
     def __init__(
@@ -478,7 +481,19 @@ class FixtureReranker:
 
             golden = load_golden()
 
-        scores = _load_rerank_scores(fixtures_dir)
+        by_revision = _load_rerank_scores(fixtures_dir)
+        revision = cfg.reranker.revision
+        if revision not in by_revision:
+            # Redundant with the manifest guard, but keeps the scores<->manifest
+            # contract explicit: this model was never frozen, so it can't borrow
+            # another model's scores.
+            raise _fixture_error(
+                fixtures_dir,
+                f"reranker revision {revision!r} ({cfg.reranker.model_id}) has no frozen "
+                f"scores; frozen revisions: {sorted(by_revision)}",
+            )
+        scores = by_revision[revision]
+
         missing = [row["qid"] for row in golden if row["qid"] not in scores]
         if missing:
             raise _fixture_error(
@@ -499,41 +514,58 @@ def _check_rerank_manifest(
     cfg: Settings, manifest: dict, fixtures_dir: Path, live_fingerprint: str
 ) -> None:
     """Fail loudly (run make fixture) if the fixture's reranker provenance has drifted
-    from the resolved config or the committed corpus. Mirrors the sparse guard; the
-    revision check is what keys the frozen scores to a model version."""
+    from the resolved config or the committed corpus. The (model_id, revision)
+    membership check is what keys the frozen scores to a model version: a config whose
+    model was never frozen fails rather than silently reusing another model's scores."""
     reranker = manifest.get("reranker")
     if not reranker:
         raise _fixture_error(
             fixtures_dir,
             "manifest has no 'reranker' block — the rerank fixtures were never generated",
         )
-    checks = [
-        ("reranker model_id", reranker.get("model_id"), cfg.reranker.model_id),
-        ("reranker revision", reranker.get("revision"), cfg.reranker.revision),
-        ("corpus fingerprint", reranker.get("corpus_fingerprint"), live_fingerprint),
-    ]
-    for label, fixture_val, config_val in checks:
-        if fixture_val != config_val:
-            raise _fixture_error(
-                fixtures_dir,
-                f"fixture {label} {fixture_val!r} != {config_val!r}",
-            )
+    fixture_fp = reranker.get("corpus_fingerprint")
+    if fixture_fp != live_fingerprint:
+        raise _fixture_error(
+            fixtures_dir,
+            f"fixture reranker corpus fingerprint {fixture_fp!r} != {live_fingerprint!r}",
+        )
+    models = reranker.get("models", [])
+    want = {"model_id": cfg.reranker.model_id, "revision": cfg.reranker.revision}
+    if want not in models:
+        raise _fixture_error(
+            fixtures_dir,
+            f"reranker {want} is not among the frozen models {models}; the fixture was "
+            f"not built for this model/revision",
+        )
 
 
-def _load_rerank_scores(fixtures_dir: Path) -> dict[str, dict[str, float]]:
-    """Load rerank_scores.npz into {qid: {chunk_id: score}} — the frozen cross-encoder
-    score for every candidate in each golden qid's pool."""
+def _load_rerank_scores(fixtures_dir: Path) -> dict[str, dict[str, dict[str, float]]]:
+    """Load rerank_scores.npz into {revision: {qid: {chunk_id: score}}}.
+
+    Scores are keyed by reranker revision so several models coexist in one archive
+    (all sharing the same per-qid ``chunk_ids`` pool). ``scores`` is a
+    [n_models, n_qids, depth] array aligned to ``revisions`` and ``chunk_ids``."""
     path = fixtures_dir / RERANK_SCORES_FILE
     if not path.exists():
         raise _fixture_error(fixtures_dir, f"{path} not found")
     with np.load(path) as data:
+        if "revisions" not in data.files:
+            raise _fixture_error(
+                fixtures_dir,
+                "rerank_scores.npz has no 'revisions' array — it is a stale single-model "
+                "fixture from before revision-keyed scores",
+            )
         qids = [str(q) for q in data["qids"]]
         chunk_ids = data["chunk_ids"]
+        revisions = [str(r) for r in data["revisions"]]
         scores = data["scores"]
     return {
-        qid: {
-            str(c): float(s)
-            for c, s in zip(chunk_ids[i], scores[i], strict=True)
+        rev: {
+            qid: {
+                str(c): float(s)
+                for c, s in zip(chunk_ids[i], scores[m][i], strict=True)
+            }
+            for i, qid in enumerate(qids)
         }
-        for i, qid in enumerate(qids)
+        for m, rev in enumerate(revisions)
     }
