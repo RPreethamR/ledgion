@@ -211,3 +211,53 @@ def test_tier1_two_runs_are_identical():
     # metric, every per-question record. This is the determinism guarantee that
     # makes results/<hash>.json reproducible.
     assert _run() == _run()
+
+
+# --- reranking as a post-retrieval stage (Phase 7) --------------------------
+
+
+class _ReversingReranker:
+    """Reverses the candidate pool — a pure permutation, no model. Reversing is the
+    starkest way to show the pool-integrity invariant: it changes every rank yet adds
+    and removes nothing, so recall@k (full depth) must not move."""
+
+    def rerank(self, query, candidates, *, top_n):
+        return list(reversed(candidates))[:top_n]
+
+
+def test_reranker_preserves_recall_at_k_but_moves_recall_at_10():
+    # The pool-integrity property check, in miniature (DECISIONS.md Phase 7): reranking
+    # reorders the top_k pool, it never adds to it — so recall@k (scored over the whole
+    # reordered pool) is invariant, while recall@10 is exactly what reranking can move.
+    golden = [
+        {
+            "qid": "q",
+            "doc_id": "AMCOR_2023_10K",
+            "question": "q?",
+            "answer_type": "numeric",
+            "evidence_pages": [52],
+        }
+    ]
+    # 20 distinct pages; the evidence page is buried at rank 20 (past the top 10).
+    pages = list(range(1, 20)) + [52]
+    retriever = _FakeRetriever({"q?": pages})
+    specs = ["recall@k", "recall@10"]
+
+    base = run_tier1(golden, retriever, top_k=20, metric_specs=specs, default_k=20)
+    reranked = run_tier1(
+        golden,
+        retriever,
+        top_k=20,
+        metric_specs=specs,
+        default_k=20,
+        reranker=_ReversingReranker(),
+    )
+    base_m = base["results"][0]["metrics"]
+    rr_m = reranked["results"][0]["metrics"]
+
+    # recall@k (full pool) is unchanged — the invariant.
+    assert base_m["recall@k"] == 1.0
+    assert rr_m["recall@k"] == 1.0
+    # recall@10 is what reranking promoted: buried past rank 10, now surfaced.
+    assert base_m["recall@10"] == 0.0
+    assert rr_m["recall@10"] == 1.0

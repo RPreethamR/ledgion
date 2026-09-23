@@ -40,12 +40,14 @@ from ledgion.config import REPO_ROOT, Settings
 from ledgion.ingest.index import DENSE_VECTOR, QdrantIndexer
 from ledgion.interfaces import Chunk, RetrievedChunk
 from ledgion.retrieve.dense import DenseRetriever
+from ledgion.retrieve.rerank import rerank_by_scores
 from ledgion.retrieve.sparse import bm25_params, corpus_fingerprint, tokenizer_config
 
 FIXTURES_DIR = REPO_ROOT / "fixtures"
 INDEX_FILE = "index.npz"
 QUERY_VECTORS_FILE = "query_vectors.npz"
 SPARSE_RANKINGS_FILE = "sparse_rankings.npz"
+RERANK_SCORES_FILE = "rerank_scores.npz"
 MANIFEST_FILE = "manifest.json"
 
 # Depth at which sparse rankings are stored, independent of retrieval.top_k. The
@@ -380,5 +382,158 @@ def _load_sparse_rankings(fixtures_dir: Path) -> dict[str, tuple[list[str], list
         scores = data["scores"]
     return {
         qid: ([str(c) for c in chunk_ids[i]], [float(s) for s in scores[i]])
+        for i, qid in enumerate(qids)
+    }
+
+
+# -- fixture-backed reranking ------------------------------------------------
+
+
+class FixtureReranker:
+    """The offline reranking stage: replays frozen cross-encoder scores instead of a
+    live model, so a reranked run scores in CI exactly like the live path.
+
+    ``fixtures/rerank_scores.npz`` holds, per golden qid, the cross-encoder score for
+    every candidate chunk_id in that question's pool — frozen once, locally, by
+    ``make fixture`` at ``candidate_depth`` (the dense top-``depth`` pool, which
+    contains every reranked config's pool). This stage maps the question to its qid,
+    looks the frozen scores up, and hands them to ``rerank_by_scores`` — the *same*
+    reordering primitive the live ``CrossEncoderReranker`` uses, so the two produce
+    identical rankings by construction.
+
+    ⚠️ If a candidate has no frozen score it **raises** (run make fixture). It never
+    skips the candidate and never defaults the score to zero or the minimum: a PR that
+    changes retrieval can pull a chunk into the pool that was never scored, and
+    silently reranking that partial pool would be a wrong result nobody noticed. Loud
+    failure is the contract — the same role the missing-query-vector guard plays for
+    the dense fixture.
+
+    Construction runs the same class of guard as the sparse fixture (run make fixture
+    on any):
+
+    1. the manifest carries a ``reranker`` block (fixtures were built with reranking);
+    2. its model_id and revision equal the resolved config's — the lookup is keyed on
+       the revision, so changing the model can't reuse stale frozen scores;
+    3. its corpus fingerprint equals the live one recomputed from ``index.npz``;
+    4. every golden qid has frozen scores.
+    """
+
+    def __init__(
+        self,
+        *,
+        scores_by_qid: dict[str, dict[str, float]],
+        qid_by_question: dict[str, str],
+        top_n: int,
+    ) -> None:
+        self._scores = scores_by_qid
+        self._qid_by_question = qid_by_question
+        self._top_n = top_n
+
+    def rerank(
+        self, query: str, candidates: Sequence[RetrievedChunk], *, top_n: int
+    ) -> list[RetrievedChunk]:
+        if not candidates:
+            return []
+        try:
+            qid = self._qid_by_question[query]
+        except KeyError as exc:
+            raise KeyError(
+                f"no frozen rerank scores for question {query!r}; it is not a golden "
+                f"question this fixture set was built for (run make fixture)"
+            ) from exc
+
+        frozen = self._scores[qid]
+        scores: list[float] = []
+        for rc in candidates:
+            cid = rc.chunk.chunk_id
+            if cid not in frozen:
+                # A candidate the frozen pool never scored — never skip it, never
+                # default the score. Fail loudly so a retrieval change that widened
+                # the pool can't silently rerank a partial one.
+                raise SystemExit(
+                    f"candidate chunk_id {cid!r} (qid {qid}) has no precomputed "
+                    f"cross-encoder score: retrieval pulled a chunk the frozen rerank "
+                    f"pool never scored. Never rerank a partial pool — run make fixture."
+                )
+            scores.append(frozen[cid])
+        return rerank_by_scores(candidates, scores, top_n=top_n)
+
+    @classmethod
+    def from_config(
+        cls,
+        cfg: Settings,
+        *,
+        fixtures_dir: Path = FIXTURES_DIR,
+        golden: Sequence[dict] | None = None,
+    ) -> FixtureReranker:
+        fixtures_dir = Path(fixtures_dir)
+        manifest = _load_manifest(fixtures_dir)
+
+        index = _load_index_arrays(fixtures_dir)
+        live_fp = corpus_fingerprint([str(cid) for cid in index["chunk_id"]])
+        _check_rerank_manifest(cfg, manifest, fixtures_dir, live_fp)
+
+        if golden is None:
+            from ledgion.eval.runner import load_golden
+
+            golden = load_golden()
+
+        scores = _load_rerank_scores(fixtures_dir)
+        missing = [row["qid"] for row in golden if row["qid"] not in scores]
+        if missing:
+            raise _fixture_error(
+                fixtures_dir,
+                f"{len(missing)} golden qid(s) have no frozen rerank scores: "
+                f"{', '.join(missing[:5])}{' …' if len(missing) > 5 else ''}",
+            )
+
+        qid_by_question = {row["question"]: row["qid"] for row in golden}
+        return cls(
+            scores_by_qid=scores,
+            qid_by_question=qid_by_question,
+            top_n=cfg.reranker.top_n,
+        )
+
+
+def _check_rerank_manifest(
+    cfg: Settings, manifest: dict, fixtures_dir: Path, live_fingerprint: str
+) -> None:
+    """Fail loudly (run make fixture) if the fixture's reranker provenance has drifted
+    from the resolved config or the committed corpus. Mirrors the sparse guard; the
+    revision check is what keys the frozen scores to a model version."""
+    reranker = manifest.get("reranker")
+    if not reranker:
+        raise _fixture_error(
+            fixtures_dir,
+            "manifest has no 'reranker' block — the rerank fixtures were never generated",
+        )
+    checks = [
+        ("reranker model_id", reranker.get("model_id"), cfg.reranker.model_id),
+        ("reranker revision", reranker.get("revision"), cfg.reranker.revision),
+        ("corpus fingerprint", reranker.get("corpus_fingerprint"), live_fingerprint),
+    ]
+    for label, fixture_val, config_val in checks:
+        if fixture_val != config_val:
+            raise _fixture_error(
+                fixtures_dir,
+                f"fixture {label} {fixture_val!r} != {config_val!r}",
+            )
+
+
+def _load_rerank_scores(fixtures_dir: Path) -> dict[str, dict[str, float]]:
+    """Load rerank_scores.npz into {qid: {chunk_id: score}} — the frozen cross-encoder
+    score for every candidate in each golden qid's pool."""
+    path = fixtures_dir / RERANK_SCORES_FILE
+    if not path.exists():
+        raise _fixture_error(fixtures_dir, f"{path} not found")
+    with np.load(path) as data:
+        qids = [str(q) for q in data["qids"]]
+        chunk_ids = data["chunk_ids"]
+        scores = data["scores"]
+    return {
+        qid: {
+            str(c): float(s)
+            for c, s in zip(chunk_ids[i], scores[i], strict=True)
+        }
         for i, qid in enumerate(qids)
     }

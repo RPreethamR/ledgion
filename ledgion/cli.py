@@ -68,6 +68,15 @@ def ask(
 
     retriever = DenseRetriever.from_config(cfg)
     contexts = retriever.retrieve(question, top_k=cfg.retrieval.top_k)
+    if cfg.reranker.enabled:
+        # Serving use of the reranker: reorder the top_k pool and trim to top_n so the
+        # generator sees only the best few chunks. (Eval scores the full reordered pool
+        # instead — see run_tier1 — so this top_n truncation never affects the metrics.)
+        from ledgion.retrieve.rerank import CrossEncoderReranker
+
+        contexts = CrossEncoderReranker.from_config(cfg).rerank(
+            question, contexts, top_n=cfg.reranker.top_n
+        )
     generator = GeminiGenerator.from_config(cfg)
     try:
         answer = generator.generate(question, contexts)
@@ -180,15 +189,22 @@ def fixture(config: Path | None = _ConfigOption) -> None:
     typer.echo(
         f"wrote {summary['chunk_count']} chunk vectors, "
         f"{summary['query_count']} query vectors, "
-        f"sparse rankings at depth {summary['stored_depth']}  ->  {summary['out_dir']}"
+        f"sparse rankings at depth {summary['stored_depth']}, "
+        f"rerank scores at depth {summary['rerank_depth']}  ->  {summary['out_dir']}"
     )
     sizes = summary["sizes"]
-    for name in ("index.npz", "query_vectors.npz", "sparse_rankings.npz", "manifest.json"):
+    for name in (
+        "index.npz",
+        "query_vectors.npz",
+        "sparse_rankings.npz",
+        "rerank_scores.npz",
+        "manifest.json",
+    ):
         typer.echo(f"  {name:<22} {sizes[name] / 1024:>8.1f} KiB")
-    added = sizes["sparse_rankings.npz"]
+    rerank_added = sizes["rerank_scores.npz"]
     typer.echo(
         f"  total {summary['total_bytes'] / 1024:.1f} KiB "
-        f"(sparse rankings add {added / 1024:.1f} KiB)"
+        f"(rerank scores add {rerank_added / 1024:.1f} KiB)"
     )
 
 

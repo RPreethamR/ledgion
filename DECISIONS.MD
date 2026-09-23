@@ -208,3 +208,23 @@ Decision: dense stays default. No hybrid row passes the recall@10
 gate. Below sw 0.55 the candidate set equals dense's, so under a
 reranker hybrid is identical to dense by construction.
 Hybrid code and sparse fixture kept; re-run at corpus scale.
+
+## Phase 7 — depth diagnostic (before reranking)
+Dense at top_k=200, 35 evidence pairs:
+  ranks 1-10: 17 | 11-50: 11 | 51-100: 3 | 101-200: 1 | absent: 3
+Depth 50 → 200 rescues 4 pairs. Keeping top_k=50; deeper pool
+isn't worth the reranker latency. Will report a k=100 row.
+
+Reranker ceiling is exact: 28/35 pairs are in the top 50.
+  recall@50 MUST stay .8167 — reranking reorders, never adds.
+  recall@10 can rise from .500 to at most .800.
+Pre-registered: large recall@10 gain, recall@50 unchanged.
+Any change to recall@50 means the pipeline is broken.
+
+Amex p96 is the evidence page for two questions: id_00720
+(prose) at rank 156, id_00723 (numeric) absent at 200. Same page,
+same index, same embedder — the difference is query phrasing
+alone. Strongest motivating case for Phase 9 query rewriting.
+
+Three pairs absent at depth 200 are a floor for bge-base with the
+question as written, not an absolute floor.
