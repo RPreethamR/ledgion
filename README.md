@@ -51,7 +51,8 @@ or narrative (prose).
 
 **Read:** the evidence page is *found* 82% of the time (recall@50) but *ranked in the
 top 10* only 50% of the time — a ranking problem, not a finding problem. Closing that
-gap is the goal of the ablations: hybrid BM25 (measured below), then reranking.
+gap is the goal of the ablations: hybrid BM25 and cross-encoder reranking (both
+measured below).
 
 ## Hybrid retrieval: measured, not adopted
 
@@ -92,6 +93,43 @@ early-rank gain (best: stopwords · sw0.25, nDCG@10 +0.014, hit@1 +0.067). Those
 are marginal and ranking-only, so hybrid ships as a documented, reproducible ablation
 rather than the default — the honest next lever is reranking. See
 [`DECISIONS.md`](DECISIONS.MD) for the full analysis.
+
+## Reranking: measured, not adopted
+
+Phase 7 added cross-encoder reranking as a stage *after* retrieval — it reorders
+whatever dense (or hybrid) returns, so neither arm knows it exists. Scoring is over the
+**full reordered candidate pool**, not the 5 chunks served to the model, so recall@k
+stays comparable to dense and becomes a *pool-integrity invariant*: reranking permutes
+the pool, it never adds to it, so recall@50 must stay **exactly 0.817** on every
+top_k=50 row (it did — any drift would be a bug, not a finding). Two rerankers were
+compared: `ms-marco-MiniLM-L-6-v2` (22M params) and `bge-reranker-base` (278M).
+
+Latency is p50 in ms per question, retrieval and reranking as separate stages (CPU,
+4 threads) — a reranker is a quality-for-cost trade, so both halves are shown.
+
+| Run                    | hit@1 |  MRR | nDCG@10 | recall@10 | recall@50 | retr | rerank |
+|:-----------------------|------:|-----:|--------:|----------:|----------:|-----:|-------:|
+| dense (baseline)       | 0.133 | 0.252 | 0.291 |    0.500 |     0.817 |   83 |      — |
+| dense + MiniLM         | 0.033 | 0.203 | 0.262 |    0.517 |     0.817 |   88 |   4826 |
+| dense + bge            | 0.100 | 0.204 | 0.264 |  **0.533** |   0.817 |   97 |  27375 |
+| dense · k100           | 0.133 | 0.253 | 0.291 |    0.500 |     0.850 |   83 |      — |
+| dense + MiniLM · k100  | 0.033 | 0.191 | 0.262 |    0.533 |     0.844 |  110 |  10860 |
+| hybrid + MiniLM        | 0.033 | 0.203 | 0.262 |    0.517 |     0.817 |  120 |   5668 |
+
+(The two `k100` rows pull a 100-candidate pool; their full-depth recall is 0.889, and
+that invariant held across the reranked/un-reranked pair too.)
+
+**Why measured, not adopted.** No reranker beats the dense baseline on hit@1, MRR, or
+nDCG@10 — both *drop* hit@1 (to 0.033 with MiniLM, 0.100 with bge). `dense + bge` is the
+only row to beat baseline recall@10 (0.533 vs 0.500) — the larger model does rescue
+buried evidence into the top 10 — but it costs **~27 s/question**, ~285× the retrieval
+stage and ~5.7× MiniLM, which doesn't justify adoption. `hybrid + MiniLM` is identical
+to `dense + MiniLM` on every metric, confirming that at `sw0.25` the fused pool *is*
+dense's pool. The failure is a domain mismatch, not truncation (only 2.3% of
+query+chunk pairs exceed the 512-token cap, by ≤25 tokens): MS-MARCO-trained
+cross-encoders reward prose that restates the question, while 10-K evidence is a numeric
+table whose header does not. Both models' frozen scores are kept for re-measurement at
+corpus scale. See [`DECISIONS.md`](DECISIONS.MD) for the full analysis.
 
 ## CI gate
 
