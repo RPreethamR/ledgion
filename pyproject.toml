@@ -55,6 +55,12 @@ torch = { index = "pytorch-cpu" }
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+# Notebooks target the Colab runtime, not the project's py311, and follow notebook
+# idioms ruff fights (clone-then-import, magics, cross-cell names). Excluded so
+# `ruff check .` (and CI) lints the package, not the Colab orchestration notebook —
+# e.g. UP017 would rewrite datetime.timezone.utc to datetime.UTC, which breaks on
+# Colab's Python 3.10.
+extend-exclude = ["notebooks"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "W", "UP", "B", "A"]
@@ -78,4 +84,14 @@ dev = [
 # install a torch-free environment on any runner: `uv sync --no-group models`.
 models = [
     "sentence-transformers>=6.0.1",
+]
+# Docling (Phase 8 parser ablation). A layout + TableFormer model stack on torch —
+# multiple GB, too heavy for the 4GB-VRAM / 8GB-RAM laptop, so it runs ONCE on Colab
+# (notebooks/colab_docling_parse.ipynb) and never in the local or CI path. This group
+# is deliberately NOT in `default-groups` and NOT in [project.dependencies], so a
+# plain `uv sync` and CI's `uv sync --no-group models` both skip it entirely. Install
+# it only where it's wanted (Colab, or a beefy box): `uv sync --group docling`. Pinned
+# exactly so the Colab run and the recorded manifest version can never disagree.
+docling = [
+    "docling==2.130.0",
 ]

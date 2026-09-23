@@ -288,3 +288,21 @@ a cache; fixture holds both (+12.3 KiB).
 Decision: dense stays default, no reranker adopted. Reranking code +
 both frozen score sets kept for re-measurement at corpus scale, where
 the cross-encoder has more to reorder and the domain-mismatch may ease.
+
+## Phase 8 — hypothesis (before running)
+Three indexes, same embedder, dense-only, top_k 50:
+  pymupdf (baseline), docling_flat, docling_markdown.
+flat vs pymupdf isolates the parser; markdown vs flat isolates
+table handling.
+
+1. docling_flat ≈ pymupdf. The parser change alone moves little.
+2. docling_markdown improves numeric ranking — recall@10,
+   ndcg@10, hit@1 — while numeric recall@50 stays near its .938
+   ceiling. Numeric evidence is already found; it's ranked badly.
+3. Prose roughly unchanged by table mode.
+4. id_00723 (Amex p96, numeric, absent at depth 200) is the one
+   unreachable pair a table-aware index could plausibly rescue.
+
+Risk: markdown pipes and dense number tokens may embed poorly
+in bge-base, giving table chunks worse similarity to
+natural-language questions than flattened text had.
