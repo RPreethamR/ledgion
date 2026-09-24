@@ -319,3 +319,43 @@ handling).
 Alignment PASS: 0 drift at a 5-pt tolerance on token_set_ratio,
 confirmed tolerance-free by the evidence guard. 26 thin pages,
 all TOC/index/exhibits, none golden.
+
+
+## Adoption rule (recorded before the docling_linearized run)
+A configuration replaces the current default only if, on the Tier 1
+eval (overall, 30 golden questions, clean tree, against
+fixtures/baseline_metrics.json):
+
+1. No regression: recall@10, ndcg@10 and recall@50 each fall no more
+   than 0.02 below the default.
+2. Real improvement: recall@10 or ndcg@10 rises by more than 0.02.
+
+If several qualify, adopt the largest ndcg@10 gain; ties go to recall@10.
+
+recall@50 is guarded but cannot qualify a config on its own. It measures
+the candidate pool: evidence lost there is unrecoverable for every later
+stage, while gaining it by retrieving more candidates is a budget
+change, not a quality gain.
+
+Reported with every decision, not gating: the numeric/prose split,
+hit@1, mrr, latency, and any new operational dependency. A qualifying
+config is adopted unless a written reason cites one of these.
+Overrides only run one way: a config that fails the rule is never
+adopted.
+
+The 0.02 tolerance is below one question at n=30. When the golden set
+grows, re-derive it before looking at any results.
+
+Why now: earlier phases used two phrasings ("wins on recall@10 and
+ndcg@10"; "passes the gate"). This replaces both. Guarding recall@50
+is new — without it, docling_markdown qualifies despite numeric
+recall@50 falling .9375 → .6562.
+
+Retroactive check — no earlier decision changes:
+  Phase 6 hybrid rows    fail 1 on recall@10 (−.033 to −.117)
+  Phase 7 reranked rows  fail 1 on ndcg@10 (−.026 to −.029)
+  dense_k100             passes 1, fails 2 (no ranking gain)
+Phase 8, written with these results already visible:
+  docling_markdown       fails 1: recall@50 −.150
+  docling_flat           fails 1: recall@50 −.033 (one numeric question)
+  docling_linearized     not yet run — the only row this rule is blind to

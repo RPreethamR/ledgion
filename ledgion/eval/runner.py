@@ -200,7 +200,9 @@ def format_compare(old: dict, new: dict) -> str:
 # is a fixed-cutoff column comparable across configs (a pool-integrity invariant only
 # for the top_k=50 rows — see the Phase 7 note in DECISIONS.md).
 _METRIC_ORDER = ("hit@1", "mrr", "ndcg@10", "recall@10", "recall@50", "recall@k")
-_LABEL_WIDTH = 26
+# Wide enough for a labelled row like "dense docling-markdown 42da16" (Phase 8) without
+# the metric columns drifting out of alignment.
+_LABEL_WIDTH = 31
 _COL_WIDTH = 11
 
 
@@ -214,6 +216,10 @@ def _run_label(report: dict) -> str:
     and a reranked deeper-pool run reads as ``dense rerank k100 <hash>``."""
     cfg = report.get("config", {})
     parts = [_run_backend(report)]
+    # Surface a non-default parser (Phase 8): pymupdf is the default and stays implicit,
+    # like top_k=50, so prior rows are unchanged; a docling run reads "dense docling-flat".
+    if cfg.get("parser", {}).get("backend") == "docling":
+        parts.append(f"docling-{cfg.get('chunk', {}).get('table_mode', '?')}")
     if _run_backend(report) == "hybrid":
         sw = cfg.get("fusion", {}).get("sparse_weight")
         if sw is not None:
