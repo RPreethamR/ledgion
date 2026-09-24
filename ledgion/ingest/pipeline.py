@@ -216,7 +216,9 @@ def run(cfg: Settings | None = None, *, force: bool = False) -> dict:
             n_pages = len(pages)
 
         hits_before = embedder.cache_hits
-        vectors = embedder.embed_documents([c.text for c in chunks])
+        vectors = embedder.embed_documents(
+            [c.text for c in chunks], ids=[c.chunk_id for c in chunks]
+        )
         hits = embedder.cache_hits - hits_before
 
         indexer.upsert(chunks, vectors)

@@ -64,6 +64,20 @@ def test_exactly_at_tolerance_passes():
     assert result.ok
 
 
+def test_gate_fails_on_recall50_regression_naming_it():
+    # The adoption rule guards recall@50, so the gate does too. A run that holds
+    # recall@10 and ndcg@10 but drops recall@50 by 0.03 (> tolerance) must fail, and
+    # the message must name recall@50 as the culprit.
+    gated = ["recall@10", "ndcg@10", "recall@50"]
+    baseline = {"recall@10": 0.5, "ndcg@10": 0.3, "recall@50": 0.816667}
+    current = {"recall@10": 0.5, "ndcg@10": 0.3, "recall@50": 0.786667}  # -0.03
+    result = check_gate(current, baseline, gated_metrics=gated, tolerance=_TOL)
+    assert not result.ok
+    regressed = [c.metric for c in result.checks if c.regressed]
+    assert regressed == ["recall@50"]
+    assert "recall@50" in result.message()
+
+
 def test_missing_gated_metric_is_a_loud_error():
     # If the run never computed a gated metric, that's a config mistake, not a pass.
     current = {"recall@10": 0.6}  # ndcg@10 absent

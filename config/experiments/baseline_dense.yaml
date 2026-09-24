@@ -101,6 +101,7 @@ eval:
   metrics:
     - recall@k
     - recall@10
+    - recall@50
     - ndcg@10
     - mrr
     - hit@1

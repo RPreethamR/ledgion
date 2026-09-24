@@ -17,21 +17,20 @@ Two properties the cache must hold:
   same reason the embedder refuses to load at all if ``revision`` is ``None``: a
   pin nothing reads is worse than no pin.
 
-Truncation is made visible, not silent: before encoding, any input longer than
-``max_seq_length`` tokens is logged with its length. With ``chunk.size`` held at
-448 tokens this should never fire — the log is the tripwire that proves it.
+Oversized inputs raise; they are never truncated. Before encoding, any input
+longer than ``max_seq_length`` tokens fails loudly with its chunk id and length.
+With ``chunk.size`` held at 448 (headroom below bge's 512 window) this never
+fires — an oversized chunk means a chunker bug, and silently dropping its tail
+tokens would corrupt the index instead of surfacing the bug.
 """
 
 from __future__ import annotations
 
 import hashlib
-import logging
 from collections.abc import Sequence
 from pathlib import Path
 
 import numpy as np
-
-logger = logging.getLogger(__name__)
 
 
 def cache_key(revision: str, text: str) -> str:
@@ -111,9 +110,11 @@ class BGEEmbedder:
                 self.model_id, revision=self.revision, device=self.device
             )
             model.max_seq_length = self.max_seq_length
-            # Raise the tokenizer's own cap so the truncation *check* below can
-            # measure true length without transformers warning on long inputs;
-            # real truncation still happens at model.max_seq_length during encode.
+            # Lift the tokenizer's own cap so the length *guard* can measure an
+            # input's true token count (transformers would otherwise clamp to 512
+            # and warn). The guard raises on anything over max_seq_length before
+            # encode, so the model never sees — and never truncates — an oversized
+            # input.
             model.tokenizer.model_max_length = int(1e9)
             self._model = model
         return self._model
@@ -125,8 +126,15 @@ class BGEEmbedder:
 
     # -- Embedder contract ---------------------------------------------------
 
-    def embed_documents(self, texts: Sequence[str]) -> list[np.ndarray]:
-        """Embed document chunks, reading/writing the disk cache per text."""
+    def embed_documents(
+        self, texts: Sequence[str], *, ids: Sequence[str] | None = None
+    ) -> list[np.ndarray]:
+        """Embed document chunks, reading/writing the disk cache per text.
+
+        ``ids`` (the chunk ids, positionally aligned to ``texts``) is optional and
+        used only to name an offending chunk if the length guard fires; the pipeline
+        passes ``[c.chunk_id for c in chunks]`` so an oversized chunk is identifiable.
+        """
         self._ensure_model()
         keys = [cache_key(self.revision, t) for t in texts]
         results: list[np.ndarray | None] = [None] * len(texts)
@@ -144,7 +152,8 @@ class BGEEmbedder:
                 self.cache_misses += 1
 
         if to_encode:
-            self._warn_truncation(to_encode)
+            encode_ids = [ids[i] for i in to_encode_idx] if ids is not None else None
+            self._check_lengths(to_encode, encode_ids)
             vectors = self._model.encode(
                 to_encode,
                 batch_size=self.batch_size,
@@ -166,6 +175,7 @@ class BGEEmbedder:
         measurable ablation rather than a constant baked in here."""
         self._ensure_model()
         prompt = f"{self.query_instruction} {text}".strip() if self.query_instruction else text
+        self._check_lengths([prompt], ["query"])
         vec = self._model.encode(
             [prompt],
             batch_size=1,
@@ -192,18 +202,21 @@ class BGEEmbedder:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         np.save(self.cache_dir / f"{key}.npy", vec)
 
-    # -- truncation tripwire -------------------------------------------------
+    # -- length guard --------------------------------------------------------
 
-    def _warn_truncation(self, texts: Sequence[str]) -> None:
-        """Log any input whose tokenised length exceeds ``max_seq_length`` — the
-        point past which the model silently drops tokens."""
+    def _check_lengths(self, texts: Sequence[str], ids: Sequence[str] | None = None) -> None:
+        """Raise if any input's tokenised length (with special tokens, as the model
+        counts them) exceeds ``max_seq_length``. Never truncate: an oversized input
+        is a chunker bug and must fail loudly with the offending chunk id, its length,
+        and the limit — silently dropping tail tokens would corrupt the index."""
         encoded = self._model.tokenizer(list(texts), add_special_tokens=True)["input_ids"]
-        for text, ids in zip(texts, encoded, strict=True):
-            if len(ids) > self.max_seq_length:
-                logger.warning(
-                    "chunk exceeds max_seq_length and will be truncated: "
-                    "%d > %d tokens: %.80r",
-                    len(ids),
-                    self.max_seq_length,
-                    text,
+        for i, token_ids in enumerate(encoded):
+            length = len(token_ids)
+            if length > self.max_seq_length:
+                label = ids[i] if ids is not None else f"input[{i}]"
+                raise ValueError(
+                    f"embedding input {label!r} is {length} tokens, over the "
+                    f"embedding.max_seq_length limit of {self.max_seq_length}. An "
+                    f"oversized chunk is a chunker bug — fix the chunker; the embedder "
+                    f"never truncates."
                 )

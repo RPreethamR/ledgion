@@ -1,5 +1,5 @@
 {
-  "_comment": "main's current Tier-1 overall metrics — the CI gate's reference. Update BY HAND, in the PR that improves them (see ledgion/eval/gate.py). The gate reads `metrics`; the rest is provenance. Regenerated when Tier 1 moved to (doc_id, page_num) scoring: mrr/ndcg@10 dipped as wrong-filing page-number collisions no longer count; recall@10/recall@k unchanged (dense already returns the right filing).",
+  "_comment": "main's current Tier-1 overall metrics — the CI gate's reference. Update BY HAND, in the PR that improves them (see ledgion/eval/gate.py). The gate reads `metrics`; the rest is provenance. recall@50 added (Phase 8) so the gate guards the candidate-pool recall the adoption rule protects; at top_k=50 it equals recall@k. Regenerated when Tier 1 moved to (doc_id, page_num) scoring: mrr/ndcg@10 dipped as wrong-filing page-number collisions no longer count; recall@10/recall@k unchanged (dense already returns the right filing).",
   "generated_from_git_sha": "55fa64f4458eaa8f71572ee7d428d1d10ed9d1dc",
   "tier": 1,
   "metrics": {
@@ -7,6 +7,7 @@
     "mrr": 0.252118,
     "ndcg@10": 0.290594,
     "recall@10": 0.5,
+    "recall@50": 0.816667,
     "recall@k": 0.816667
   }
 }

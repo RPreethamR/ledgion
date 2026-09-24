@@ -121,3 +121,5 @@ eval:
   gate_metrics:               # metrics the CI gate enforces against fixtures/baseline_metrics.json
     - recall@10
     - ndcg@10
+    - recall@50               # guarded per the adoption rule (DECISIONS.md): evidence lost
+                              # from the candidate pool is unrecoverable downstream
