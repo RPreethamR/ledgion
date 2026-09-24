@@ -260,6 +260,15 @@ class RecursiveChunker:
         tok = self._tokenizer()
         return len(tok(text, add_special_tokens=False)["input_ids"])
 
+    def split_text(self, text: str) -> list[str]:
+        """Split one string into chunk texts each within ``size`` (configured unit).
+
+        The same recursive-span logic ``chunk`` applies per page, exposed for the
+        table-aware chunker to cap a single oversized table part (e.g. a giant
+        exhibit-index cell) that a row-group split cannot shrink on its own.
+        """
+        return [text[start:end] for start, end in self._chunk_page(text)]
+
     def _tokenizer(self):
         if self._tok is None:
             if self.tokenizer_model_id is None:
@@ -498,12 +507,29 @@ class TableAwareChunker:
             else:
                 texts = self._split_table_rows(base, body_lines)
 
+        # Guarantee every part fits the budget. A single huge cell (an exhibit-index
+        # row, say) can exceed `size`, and a row-group split can't shrink one row — the
+        # embedder would then crash on a >512-token input. Split any oversized part as
+        # plain text so no table chunk ever exceeds the budget the recursive chunker
+        # already honours for prose.
+        texts = self._cap_parts(texts)
+
         chunks: list[Chunk] = []
         for part, text in enumerate(texts):
             cid = _table_chunk_id(doc_id, page, element.get("element_index", 0), part)
             self.last_table_chunk_ids.add(cid)
             chunks.append(Chunk(chunk_id=cid, doc_id=doc_id, page_num=page, text=text, **meta))
         return chunks
+
+    def _cap_parts(self, texts: Sequence[str]) -> list[str]:
+        """Recursively split any part still over ``size`` (a single giant cell)."""
+        capped: list[str] = []
+        for text in texts:
+            if self._text.count_tokens(text) > self.size:
+                capped.extend(self._text.split_text(text) or [text])
+            else:
+                capped.append(text)
+        return capped
 
     def _split_table_rows(self, base: str, body_lines: Sequence[str]) -> list[str]:
         """Greedily pack rows into parts so each ``base`` (prefix + header) + its rows

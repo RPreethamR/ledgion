@@ -134,6 +134,21 @@ def test_oversized_table_splits_by_rows_with_header_repeated():
 # --- flat mode --------------------------------------------------------------
 
 
+def test_giant_cell_table_never_exceeds_size():
+    # An exhibit-index row can be one enormous cell that a row-group split can't
+    # shrink; it must still be capped to the budget (else the embedder crashes on a
+    # >512-token input, as PepsiCo p126 did).
+    chunker = _chunker("markdown", size=90)
+    giant = "senior notes due 2044 " * 40  # ~880 chars in one cell
+    elements = [_table(0, 1, ["Ref", "Description"], [["4.60", giant]])]
+    chunks = chunker.chunk_elements("DOC", elements, **META)
+    table_chunks = [c for c in chunks if c.chunk_id in chunker.last_table_chunk_ids]
+    assert len(table_chunks) >= 2  # the giant cell was split
+    assert all(len(c.text) <= 90 for c in table_chunks)  # size measured in chars here
+    # Content preserved across the split.
+    assert "senior notes due 2044" in " ".join(c.text for c in table_chunks)
+
+
 def test_flat_mode_renders_table_as_plaintext_no_pipes():
     chunks = _chunker("flat").chunk_elements("DOC", _two_page_elements(), **META)
     # Flat mode never emits markdown pipes; numbers sit next to their labels.
