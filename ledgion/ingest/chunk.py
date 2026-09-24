@@ -41,6 +41,7 @@ from ledgion.ingest.docling_artifact import (
     group_by_page,
     load_elements,
     render_table_flat,
+    table_linearized_lines,
     table_markdown_parts,
 )
 from ledgion.interfaces import Chunk
@@ -340,7 +341,7 @@ class TableAwareChunker:
         docling_dir=None,
         separators: Sequence[str] = DEFAULT_SEPARATORS,
     ) -> None:
-        if table_mode not in ("flat", "markdown"):
+        if table_mode not in ("flat", "markdown", "linearized"):
             raise ValueError(f"unknown table_mode: {table_mode!r}")
         self.size = size
         self.table_mode = table_mode
@@ -421,8 +422,8 @@ class TableAwareChunker:
             page_elements = by_page[page]
             if self.table_mode == "flat":
                 chunks.extend(self._chunk_page_flat(doc_id, page, page_elements, meta))
-            else:
-                chunks.extend(self._chunk_page_markdown(doc_id, page, page_elements, meta))
+            else:  # markdown | linearized: prose chunks identical, tables standalone
+                chunks.extend(self._chunk_page_standalone_tables(doc_id, page, page_elements, meta))
         return chunks
 
     # -- flat mode -----------------------------------------------------------
@@ -442,11 +443,14 @@ class TableAwareChunker:
             return render_table_flat(element.get("table") or {})
         return element.get("text") or ""
 
-    # -- markdown mode -------------------------------------------------------
+    # -- markdown / linearized modes (tables as standalone chunks) -----------
 
-    def _chunk_page_markdown(
+    def _chunk_page_standalone_tables(
         self, doc_id: str, page: int, elements: Sequence[dict], meta: dict
     ) -> list[Chunk]:
+        """Prose chunks exactly as flat's recursive prose (so they're identical across
+        markdown/linearized and hit the embedding cache); tables become their own
+        chunk(s), rendered per ``table_mode``."""
         prose_parts: list[str] = []
         table_chunks: list[Chunk] = []
         context: str | None = None  # nearest preceding heading / short line
@@ -492,24 +496,14 @@ class TableAwareChunker:
     def _table_chunks(
         self, doc_id: str, page: int, element: dict, prefix: str, meta: dict
     ) -> list[Chunk]:
-        table = element.get("table") or {}
-        header_lines, body_lines = table_markdown_parts(table)
-        if not header_lines and not body_lines:
-            # Degenerate/empty grid: fall back to the stored plain-text rendering so
-            # the table is still represented rather than silently dropped.
-            fallback = (element.get("text") or "").strip()
-            texts = [f"{prefix}\n{fallback}".strip()] if fallback or prefix else []
+        if self.table_mode == "linearized":
+            texts = self._linearized_table_texts(element, prefix)
         else:
-            base = f"{prefix}\n" + "\n".join(header_lines) if prefix else "\n".join(header_lines)
-            whole = base + ("\n" + "\n".join(body_lines) if body_lines else "")
-            if not body_lines or self._text.count_tokens(whole) <= self.size:
-                texts = [whole]
-            else:
-                texts = self._split_table_rows(base, body_lines)
+            texts = self._markdown_table_texts(element, prefix)
 
         # Guarantee every part fits the budget. A single huge cell (an exhibit-index
         # row, say) can exceed `size`, and a row-group split can't shrink one row — the
-        # embedder would then crash on a >512-token input. Split any oversized part as
+        # embedder would then raise on a >512-token input. Split any oversized part as
         # plain text so no table chunk ever exceeds the budget the recursive chunker
         # already honours for prose.
         texts = self._cap_parts(texts)
@@ -520,6 +514,39 @@ class TableAwareChunker:
             self.last_table_chunk_ids.add(cid)
             chunks.append(Chunk(chunk_id=cid, doc_id=doc_id, page_num=page, text=text, **meta))
         return chunks
+
+    def _markdown_table_texts(self, element: dict, prefix: str) -> list[str]:
+        """A table as markdown: the header block (+prefix) repeats in every split part."""
+        table = element.get("table") or {}
+        header_lines, body_lines = table_markdown_parts(table)
+        if not header_lines and not body_lines:
+            # Degenerate/empty grid: fall back to the stored plain-text rendering so
+            # the table is still represented rather than silently dropped.
+            fallback = (element.get("text") or "").strip()
+            return [f"{prefix}\n{fallback}".strip()] if fallback or prefix else []
+        base = f"{prefix}\n" + "\n".join(header_lines) if prefix else "\n".join(header_lines)
+        whole = base + ("\n" + "\n".join(body_lines) if body_lines else "")
+        if not body_lines or self._text.count_tokens(whole) <= self.size:
+            return [whole]
+        return self._split_table_rows(base, body_lines)
+
+    def _linearized_table_texts(self, element: dict, prefix: str) -> list[str]:
+        """A table as one self-describing line per row. Each line carries its own column
+        labels, so only the caption/heading ``prefix`` repeats across split parts."""
+        lines = table_linearized_lines(element.get("table") or {})
+        if not lines:
+            fallback = (element.get("text") or "").strip()
+            return [f"{prefix}\n{fallback}".strip()] if fallback or prefix else []
+        whole = self._compose(prefix, lines)
+        if self._text.count_tokens(whole) <= self.size:
+            return [whole]
+        return self._split_table_rows(prefix, lines)
+
+    @staticmethod
+    def _compose(base: str, lines: Sequence[str]) -> str:
+        """Join ``base`` (a possibly-empty prefix/header block) with ``lines``."""
+        body = "\n".join(lines)
+        return f"{base}\n{body}" if base else body
 
     def _cap_parts(self, texts: Sequence[str]) -> list[str]:
         """Recursively split any part still over ``size`` (a single giant cell)."""
@@ -532,19 +559,19 @@ class TableAwareChunker:
         return capped
 
     def _split_table_rows(self, base: str, body_lines: Sequence[str]) -> list[str]:
-        """Greedily pack rows into parts so each ``base`` (prefix + header) + its rows
-        stays within ``size``. ``base`` is repeated in every part, so the header row
-        appears in each. A single row that alone overflows is emitted as its own part
-        (a row can't be split)."""
+        """Greedily pack rows into parts so each ``base`` + its rows stays within
+        ``size``. ``base`` (the markdown header block, or the linearized prefix — which
+        may be empty) is repeated in every part. A single row that alone overflows is
+        emitted as its own part (a row can't be split; ``_cap_parts`` handles it)."""
         parts: list[str] = []
         current: list[str] = []
         for row in body_lines:
-            trial = base + "\n" + "\n".join([*current, row])
+            trial = self._compose(base, [*current, row])
             if current and self._text.count_tokens(trial) > self.size:
-                parts.append(base + "\n" + "\n".join(current))
+                parts.append(self._compose(base, current))
                 current = [row]
             else:
                 current.append(row)
         if current:
-            parts.append(base + "\n" + "\n".join(current))
+            parts.append(self._compose(base, current))
         return parts

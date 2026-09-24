@@ -143,7 +143,9 @@ class ChunkConfig(BaseModel):
     # "markdown" — each table becomes its own chunk(s) as a markdown table, prefixed
     #              with its caption + nearest heading/units line; an oversized table
     #              splits by row groups with the header row repeated in each part.
-    table_mode: Literal["flat", "markdown"] = "flat"
+    # "linearized" — like markdown (standalone table chunks, same prefix/splitting) but
+    #              each row is one self-describing line "row label — col: val; col: val".
+    table_mode: Literal["flat", "markdown", "linearized"] = "flat"
 
 
 class ParserConfig(BaseModel):

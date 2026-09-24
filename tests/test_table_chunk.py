@@ -131,6 +131,56 @@ def test_oversized_table_splits_by_rows_with_header_repeated():
         assert f"| Row{i} |" in joined
 
 
+# --- linearized mode --------------------------------------------------------
+
+
+def _cell(text, row, col, *, hdr=False, rowhdr=False):
+    return {"text": text, "row": row, "col": col, "row_span": 1, "col_span": 1,
+            "column_header": hdr, "row_header": rowhdr, "row_section": False}
+
+
+def test_linearized_two_header_rows_combined_labels():
+    # Two header rows (super-header + year), which must combine into one label per
+    # column, and each body row becomes one self-describing line.
+    cells = [
+        _cell("", 0, 0, hdr=True),
+        _cell("Year Ended", 0, 1, hdr=True),
+        _cell("Year Ended", 0, 2, hdr=True),
+        _cell("Metric", 1, 0, hdr=True),
+        _cell("2022", 1, 1, hdr=True),
+        _cell("2021", 1, 2, hdr=True),
+        _cell("Net revenue", 2, 0, rowhdr=True),
+        _cell("23,601", 2, 1),
+        _cell("16,434", 2, 2),
+    ]
+    elem = {
+        "doc_id": "DOC", "element_index": 0, "page_num": 1, "pages": [1], "multi_page": False,
+        "element_type": "table", "docling_label": "table", "text": "",
+        "table": {"num_rows": 3, "num_cols": 3, "caption": "", "cells": cells},
+    }
+    chunker = _chunker("linearized")
+    chunks = chunker.chunk_elements("DOC", [elem], **META)
+    table_chunks = [c for c in chunks if c.chunk_id in chunker.last_table_chunk_ids]
+    assert table_chunks
+    assert (
+        "Net revenue — Year Ended 2022: 23,601; Year Ended 2021: 16,434"
+        in table_chunks[0].text
+    )
+
+
+def test_linearized_prose_chunks_identical_to_markdown():
+    # Only table rendering differs between markdown and linearized; prose chunks must be
+    # byte-identical so they hit the embedding cache at ingest (never re-embedded).
+    els = _two_page_elements()
+    md = _chunker("markdown")
+    lin = _chunker("linearized")
+    md_chunks = md.chunk_elements("DOC", els, **META)
+    lin_chunks = lin.chunk_elements("DOC", els, **META)
+    md_prose = [c.text for c in md_chunks if c.chunk_id not in md.last_table_chunk_ids]
+    lin_prose = [c.text for c in lin_chunks if c.chunk_id not in lin.last_table_chunk_ids]
+    assert md_prose and md_prose == lin_prose
+
+
 # --- flat mode --------------------------------------------------------------
 
 

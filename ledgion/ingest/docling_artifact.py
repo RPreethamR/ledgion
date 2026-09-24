@@ -179,6 +179,52 @@ def table_markdown_parts(table: dict) -> tuple[list[str], list[str]]:
     return header_lines, body_lines
 
 
+def table_linearized_lines(table: dict) -> list[str]:
+    """One self-describing line per body row: ``<row label> — <col>: <val>; <col>: <val>``.
+
+    e.g. ``Net revenue — 2022: 23,601; 2021: 16,434``. Multi-row column headers are
+    combined into a single label per column; empty cells are skipped; the first column
+    is the row label. Because each line carries its own column labels, table_mode
+    ``linearized`` repeats only the caption/heading prefix when a big table is split —
+    there is no header row to repeat.
+    """
+    num_rows, num_cols = _grid_dims(table)
+    if num_rows == 0 or num_cols == 0:
+        return []
+    grid, header_row = _build_grid(table, escape=False)
+
+    n_head = 0
+    while n_head < num_rows and header_row[n_head]:
+        n_head += 1
+    if n_head == 0:
+        n_head = 1  # no flagged header: the first row is the column labels
+
+    def clean(text: str) -> str:
+        return " ".join(text.split())
+
+    # Combine the header rows into one label per column (top-to-bottom, non-empty).
+    col_labels = [
+        clean(" ".join(grid[r][c] for r in range(n_head) if grid[r][c].strip()))
+        for c in range(num_cols)
+    ]
+
+    lines: list[str] = []
+    for r in range(n_head, num_rows):
+        row = grid[r]
+        first = row[0] if row[0].strip() else next((x for x in row if x.strip()), "")
+        row_label = clean(first)
+        pairs = [
+            f"{col_labels[c] or f'col{c}'}: {clean(row[c])}"
+            for c in range(1, num_cols)
+            if clean(row[c])  # skip empty cells
+        ]
+        if pairs:
+            lines.append(f"{row_label} — " + "; ".join(pairs) if row_label else "; ".join(pairs))
+        elif row_label:
+            lines.append(row_label)  # a subheading / label-only row
+    return lines
+
+
 # -- page-labeled text (for the guard) ---------------------------------------
 
 
