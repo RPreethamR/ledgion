@@ -82,6 +82,28 @@ def model_revisions(cfg: Settings) -> dict:
     }
 
 
+def parser_provenance(cfg: Settings) -> dict:
+    """How the indexed corpus was parsed, for the results file.
+
+    For ``docling`` runs this pulls the Docling version and parse options from the
+    artifact's ``manifest.json`` — the numbers were produced against a *specific*
+    Docling build on Colab, and a reader must be able to tie them to it. The manifest
+    is static, so this stays deterministic (the byte-identical results guarantee holds).
+    """
+    block: dict = {"backend": cfg.parser.backend, "table_mode": cfg.chunk.table_mode}
+    if cfg.parser.backend == "docling":
+        from ledgion.ingest.docling_artifact import load_manifest
+
+        docling_dir = cfg.parser.docling_dir
+        if not docling_dir.is_absolute():
+            docling_dir = REPO_ROOT / docling_dir
+        manifest = load_manifest(docling_dir)
+        if manifest:
+            block["docling_version"] = manifest.get("docling_version")
+            block["parse_options"] = manifest.get("parse_options")
+    return block
+
+
 # -- report assembly + I/O ---------------------------------------------------
 
 
@@ -111,6 +133,7 @@ def build_report(
         "git_sha": git_sha(),
         "git_dirty": git_dirty(),
         "model_revisions": model_revisions(cfg),
+        "parser": parser_provenance(cfg),
         "metrics": tier1_result["metrics"],
         "results": tier1_result["results"],
         "config": cfg.model_dump(mode="json"),

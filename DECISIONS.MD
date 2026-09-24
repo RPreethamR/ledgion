@@ -306,3 +306,16 @@ table handling.
 Risk: markdown pipes and dense number tokens may embed poorly
 in bge-base, giving table chunks worse similarity to
 natural-language questions than flattened text had.
+
+## Phase 8 — multi-page elements
+268 Docling elements span a page break — all prose, zero tables.
+Convention: labeled with the first page, matching FinanceBench's
+evidence labeling. Invariant is now "every chunk carries exactly
+one page label."
+Guard: evidence verification re-run against chunker page labels
+on every docling ingestion; fires if golden evidence lands on a
+non-first page. Cannot affect markdown vs flat (shared prose
+handling).
+Alignment PASS: 0 drift at a 5-pt tolerance on token_set_ratio,
+confirmed tolerance-free by the evidence guard. 26 thin pages,
+all TOC/index/exhibits, none golden.
