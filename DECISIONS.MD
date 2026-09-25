@@ -359,3 +359,54 @@ Phase 8, written with these results already visible:
   docling_markdown       fails 1: recall@50 −.150
   docling_flat           fails 1: recall@50 −.033 (one numeric question)
   docling_linearized     not yet run — the only row this rule is blind to
+
+## Phase 8 — result
+Four indexes, dense-only, top_k 50, 30 questions. Δ vs pymupdf baseline
+(recall@50 == recall@k at top_k=50):
+                     hit@1   mrr    ndcg@10  r@10    r@50
+  pymupdf            .1333   .2521  .2906    .5000   .8167
+  docling_flat       +.067   +.057  +.049    ±0      −.033
+  docling_markdown   +.067   +.040  +.044    +.017   −.150
+  docling_linearized +.067   +.039  +.035    −.017   −.150
+Numeric r@50: flat .8750 (−.063); markdown/linearized both .6562 (−.281).
+Prose ≈ identical across the three docling modes (shared prose handling).
+
+Hypothesis (Phase 8) check:
+  1. flat ≈ pymupdf, parser moves little — WRONG. The parser alone lifts
+     ranking (overall ndcg@10 +.049, hit@1 +.067), all of it prose.
+  2. markdown improves numeric ranking, numeric r@50 near .938 — WRONG.
+     numeric r@50 collapses .9375 → .6562; the pre-registered pipe/number
+     embedding risk fired.
+  3. prose unchanged by table mode — CORRECT.
+  4. id_00723 rescued by a table-aware index — NO. numeric recall fell.
+
+Prose attribution (5 improved prose Qs, read-only diagnostic):
+  thin-page displacement 0 (no thin TOC page in pymupdf's top-10 for any
+  improved Q), pure rank gain 4 (evidence page 23→3, 10→1, 2→1, 7→4),
+  multi-page evidence 1 (8→3). 0 unexplained. Mechanism is better
+  evidence-chunk embeddings from Docling's reading order, not noise removal.
+
+Numeric loss (the one numeric r@50 drop under flat): id_01351 (AmEx
+effective tax rate, p44) rank 28 → absent. Both parsers hold the evidence
+on p44; Docling's reading-order reassembly composes the ratios chunk
+differently and it embeds marginally worse, pushing a borderline page
+(rank 28) past 50. Not a chunker bug — no content lost, no mislabel.
+
+Linearized (closes the row the adoption rule was blind to): ≈ markdown,
+same numeric r@50 collapse (−.281), slightly worse numeric ndcg@10. The
+row-per-line encoding does NOT rescue what markdown lost — the cause is
+table ISOLATION (tables as standalone chunks; markdown and linearized both
+do it), not markdown syntax. flat (tables inline with page prose) is the
+only mode that keeps numeric recall high.
+
+Adoption (ledgion analyze adoption, clean results only, vs
+baseline_metrics.json): nothing qualifies. flat/markdown/linearized each
+fail condition 1 on recall@50. Default stays pymupdf dense. The tool
+reproduces the retroactive table above with no mismatch.
+
+Two guards added this phase:
+- CI gate now enforces recall@50 (0.816667), so a markdown-style config that
+  trades numeric pool recall for ranking cannot pass CI.
+- The embedder RAISES on any input over max_seq_length (was a log-only
+  tripwire that never actually truncated) — an oversized chunk is a chunker
+  bug, now surfaced with its chunk id rather than silently truncated.
