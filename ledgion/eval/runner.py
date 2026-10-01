@@ -82,6 +82,28 @@ def model_revisions(cfg: Settings) -> dict:
     }
 
 
+def parser_provenance(cfg: Settings) -> dict:
+    """How the indexed corpus was parsed, for the results file.
+
+    For ``docling`` runs this pulls the Docling version and parse options from the
+    artifact's ``manifest.json`` — the numbers were produced against a *specific*
+    Docling build on Colab, and a reader must be able to tie them to it. The manifest
+    is static, so this stays deterministic (the byte-identical results guarantee holds).
+    """
+    block: dict = {"backend": cfg.parser.backend, "table_mode": cfg.chunk.table_mode}
+    if cfg.parser.backend == "docling":
+        from ledgion.ingest.docling_artifact import load_manifest
+
+        docling_dir = cfg.parser.docling_dir
+        if not docling_dir.is_absolute():
+            docling_dir = REPO_ROOT / docling_dir
+        manifest = load_manifest(docling_dir)
+        if manifest:
+            block["docling_version"] = manifest.get("docling_version")
+            block["parse_options"] = manifest.get("parse_options")
+    return block
+
+
 # -- report assembly + I/O ---------------------------------------------------
 
 
@@ -111,6 +133,7 @@ def build_report(
         "git_sha": git_sha(),
         "git_dirty": git_dirty(),
         "model_revisions": model_revisions(cfg),
+        "parser": parser_provenance(cfg),
         "metrics": tier1_result["metrics"],
         "results": tier1_result["results"],
         "config": cfg.model_dump(mode="json"),
@@ -177,7 +200,9 @@ def format_compare(old: dict, new: dict) -> str:
 # is a fixed-cutoff column comparable across configs (a pool-integrity invariant only
 # for the top_k=50 rows — see the Phase 7 note in DECISIONS.md).
 _METRIC_ORDER = ("hit@1", "mrr", "ndcg@10", "recall@10", "recall@50", "recall@k")
-_LABEL_WIDTH = 26
+# Wide enough for a labelled row like "dense docling-markdown 42da16" (Phase 8) without
+# the metric columns drifting out of alignment.
+_LABEL_WIDTH = 31
 _COL_WIDTH = 11
 
 
@@ -191,6 +216,10 @@ def _run_label(report: dict) -> str:
     and a reranked deeper-pool run reads as ``dense rerank k100 <hash>``."""
     cfg = report.get("config", {})
     parts = [_run_backend(report)]
+    # Surface a non-default parser (Phase 8): pymupdf is the default and stays implicit,
+    # like top_k=50, so prior rows are unchanged; a docling run reads "dense docling-flat".
+    if cfg.get("parser", {}).get("backend") == "docling":
+        parts.append(f"docling-{cfg.get('chunk', {}).get('table_mode', '?')}")
     if _run_backend(report) == "hybrid":
         sw = cfg.get("fusion", {}).get("sparse_weight")
         if sw is not None:

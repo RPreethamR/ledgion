@@ -1,16 +1,13 @@
-# Experiment: baseline_dense — the first recorded configuration.
+# Experiment: dense_docling_flat — Docling parser, tables flattened to plain text.
 #
-# Dense-only retrieval (embed query -> Qdrant cosine -> top_k). NO BM25, NO
-# fusion, NO reranker, NO query rewriting: the honest floor every later ablation
-# (sparse, fusion, rerank, query rewriting) is measured against.
+# One knob off the baseline: parser = docling (reads data/parsed/docling/, produced
+# once on Colab), tables rendered as PLAIN TEXT and chunked like prose. This isolates
+# the *parser* change from the *table* change — dense_docling_markdown flips table_mode
+# to markdown on top of this to isolate the table handling. Retrieval is unchanged from
+# baseline_dense: dense-only, top_k 50.
 #
-# An experiment file is a FROZEN, SELF-CONTAINED snapshot. `ledgion eval --config`
-# reads this file *instead of* config/default.yaml (env/.env still layer on top),
-# so it must fully specify the run — that is what makes its results/<hash>.json
-# reproducible forever. Later experiments are sibling files in config/experiments/
-# that change one knob at a time; the delta between their results is the point.
-#
-#   uv run ledgion eval --tier 1 --config config/experiments/baseline_dense.yaml
+#   uv run ledgion ingest --config config/experiments/dense_docling_flat.yaml
+#   uv run ledgion eval --tier 1 --config config/experiments/dense_docling_flat.yaml
 
 paths:
   data_dir: data
@@ -18,6 +15,10 @@ paths:
   financebench_dir: data/financebench
   results_dir: results
   cache_dir: .cache
+
+parser:
+  backend: docling
+  docling_dir: data/parsed/docling
 
 tickers:
   Amcor: AMCR
@@ -59,10 +60,11 @@ chunk:
   overlap: 64
   unit: tokens
   respect_page_boundary: true
+  table_mode: flat            # tables flattened to plain text, chunked as prose
 
 retrieval:
-  top_k: 50                 # candidates pulled before rerank (dense-only feeds them straight through)
-  backend: dense            # the knob the sparse/hybrid experiments flip
+  top_k: 50
+  backend: dense
 
 fusion:
   method: rrf
@@ -71,10 +73,10 @@ fusion:
   sparse_weight: 1.0
 
 qdrant:
-  mode: docker              # docker (dev, corpus loaded) | memory (CI, in-process)
+  mode: docker
   url: http://localhost:6333
   path: qdrant_storage
-  collection_name: ledgion_filings
+  collection_name: ledgion_filings_docling_flat   # own collection so all 3 coexist
   prefer_grpc: false
 
 generation:
@@ -95,13 +97,12 @@ tracing:
   secret_key_env: LANGFUSE_SECRET_KEY
 
 eval:
-  tier: 1                   # Tier 1 = deterministic, fully offline
-  ragas_enabled: false      # Tier 2 (judged) only; never gates a build
+  tier: 1
+  ragas_enabled: false
   judge_model: gemini-2.0-flash
   metrics:
     - recall@k
     - recall@10
-    - recall@50
     - ndcg@10
     - mrr
     - hit@1

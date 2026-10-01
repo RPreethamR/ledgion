@@ -288,3 +288,125 @@ a cache; fixture holds both (+12.3 KiB).
 Decision: dense stays default, no reranker adopted. Reranking code +
 both frozen score sets kept for re-measurement at corpus scale, where
 the cross-encoder has more to reorder and the domain-mismatch may ease.
+
+## Phase 8 — hypothesis (before running)
+Three indexes, same embedder, dense-only, top_k 50:
+  pymupdf (baseline), docling_flat, docling_markdown.
+flat vs pymupdf isolates the parser; markdown vs flat isolates
+table handling.
+
+1. docling_flat ≈ pymupdf. The parser change alone moves little.
+2. docling_markdown improves numeric ranking — recall@10,
+   ndcg@10, hit@1 — while numeric recall@50 stays near its .938
+   ceiling. Numeric evidence is already found; it's ranked badly.
+3. Prose roughly unchanged by table mode.
+4. id_00723 (Amex p96, numeric, absent at depth 200) is the one
+   unreachable pair a table-aware index could plausibly rescue.
+
+Risk: markdown pipes and dense number tokens may embed poorly
+in bge-base, giving table chunks worse similarity to
+natural-language questions than flattened text had.
+
+## Phase 8 — multi-page elements
+268 Docling elements span a page break — all prose, zero tables.
+Convention: labeled with the first page, matching FinanceBench's
+evidence labeling. Invariant is now "every chunk carries exactly
+one page label."
+Guard: evidence verification re-run against chunker page labels
+on every docling ingestion; fires if golden evidence lands on a
+non-first page. Cannot affect markdown vs flat (shared prose
+handling).
+Alignment PASS: 0 drift at a 5-pt tolerance on token_set_ratio,
+confirmed tolerance-free by the evidence guard. 26 thin pages,
+all TOC/index/exhibits, none golden.
+
+
+## Adoption rule (recorded before the docling_linearized run)
+A configuration replaces the current default only if, on the Tier 1
+eval (overall, 30 golden questions, clean tree, against
+fixtures/baseline_metrics.json):
+
+1. No regression: recall@10, ndcg@10 and recall@50 each fall no more
+   than 0.02 below the default.
+2. Real improvement: recall@10 or ndcg@10 rises by more than 0.02.
+
+If several qualify, adopt the largest ndcg@10 gain; ties go to recall@10.
+
+recall@50 is guarded but cannot qualify a config on its own. It measures
+the candidate pool: evidence lost there is unrecoverable for every later
+stage, while gaining it by retrieving more candidates is a budget
+change, not a quality gain.
+
+Reported with every decision, not gating: the numeric/prose split,
+hit@1, mrr, latency, and any new operational dependency. A qualifying
+config is adopted unless a written reason cites one of these.
+Overrides only run one way: a config that fails the rule is never
+adopted.
+
+The 0.02 tolerance is below one question at n=30. When the golden set
+grows, re-derive it before looking at any results.
+
+Why now: earlier phases used two phrasings ("wins on recall@10 and
+ndcg@10"; "passes the gate"). This replaces both. Guarding recall@50
+is new — without it, docling_markdown qualifies despite numeric
+recall@50 falling .9375 → .6562.
+
+Retroactive check — no earlier decision changes:
+  Phase 6 hybrid rows    fail 1 on recall@10 (−.033 to −.117)
+  Phase 7 reranked rows  fail 1 on ndcg@10 (−.026 to −.029)
+  dense_k100             passes 1, fails 2 (no ranking gain)
+Phase 8, written with these results already visible:
+  docling_markdown       fails 1: recall@50 −.150
+  docling_flat           fails 1: recall@50 −.033 (one numeric question)
+  docling_linearized     not yet run — the only row this rule is blind to
+
+## Phase 8 — result
+Four indexes, dense-only, top_k 50, 30 questions. Δ vs pymupdf baseline
+(recall@50 == recall@k at top_k=50):
+                     hit@1   mrr    ndcg@10  r@10    r@50
+  pymupdf            .1333   .2521  .2906    .5000   .8167
+  docling_flat       +.067   +.057  +.049    ±0      −.033
+  docling_markdown   +.067   +.040  +.044    +.017   −.150
+  docling_linearized +.067   +.039  +.035    −.017   −.150
+Numeric r@50: flat .8750 (−.063); markdown/linearized both .6562 (−.281).
+Prose ≈ identical across the three docling modes (shared prose handling).
+
+Hypothesis (Phase 8) check:
+  1. flat ≈ pymupdf, parser moves little — WRONG. The parser alone lifts
+     ranking (overall ndcg@10 +.049, hit@1 +.067), all of it prose.
+  2. markdown improves numeric ranking, numeric r@50 near .938 — WRONG.
+     numeric r@50 collapses .9375 → .6562; the pre-registered pipe/number
+     embedding risk fired.
+  3. prose unchanged by table mode — CORRECT.
+  4. id_00723 rescued by a table-aware index — NO. numeric recall fell.
+
+Prose attribution (5 improved prose Qs, read-only diagnostic):
+  thin-page displacement 0 (no thin TOC page in pymupdf's top-10 for any
+  improved Q), pure rank gain 4 (evidence page 23→3, 10→1, 2→1, 7→4),
+  multi-page evidence 1 (8→3). 0 unexplained. Mechanism is better
+  evidence-chunk embeddings from Docling's reading order, not noise removal.
+
+Numeric loss (the one numeric r@50 drop under flat): id_01351 (AmEx
+effective tax rate, p44) rank 28 → absent. Both parsers hold the evidence
+on p44; Docling's reading-order reassembly composes the ratios chunk
+differently and it embeds marginally worse, pushing a borderline page
+(rank 28) past 50. Not a chunker bug — no content lost, no mislabel.
+
+Linearized (closes the row the adoption rule was blind to): ≈ markdown,
+same numeric r@50 collapse (−.281), slightly worse numeric ndcg@10. The
+row-per-line encoding does NOT rescue what markdown lost — the cause is
+table ISOLATION (tables as standalone chunks; markdown and linearized both
+do it), not markdown syntax. flat (tables inline with page prose) is the
+only mode that keeps numeric recall high.
+
+Adoption (ledgion analyze adoption, clean results only, vs
+baseline_metrics.json): nothing qualifies. flat/markdown/linearized each
+fail condition 1 on recall@50. Default stays pymupdf dense. The tool
+reproduces the retroactive table above with no mismatch.
+
+Two guards added this phase:
+- CI gate now enforces recall@50 (0.816667), so a markdown-style config that
+  trades numeric pool recall for ranking cannot pass CI.
+- The embedder RAISES on any input over max_seq_length (was a log-only
+  tripwire that never actually truncated) — an oversized chunk is a chunker
+  bug, now surfaced with its chunk id rather than silently truncated.

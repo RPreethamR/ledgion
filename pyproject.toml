@@ -55,6 +55,12 @@ torch = { index = "pytorch-cpu" }
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+# Notebooks target the Colab runtime, not the project's py311, and follow notebook
+# idioms ruff fights (clone-then-import, magics, cross-cell names). Excluded so
+# `ruff check .` (and CI) lints the package, not the Colab orchestration notebook —
+# e.g. UP017 would rewrite datetime.timezone.utc to datetime.UTC, which breaks on
+# Colab's Python 3.10.
+extend-exclude = ["notebooks"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "W", "UP", "B", "A"]
@@ -79,3 +85,11 @@ dev = [
 models = [
     "sentence-transformers>=6.0.1",
 ]
+# Docling (Phase 8 parser ablation) is intentionally NOT a uv dependency or group. It
+# runs ONLY on Colab (notebooks/colab_docling_parse.ipynb, via `pip install
+# docling==2.130.0`) and never in the local or CI env. It cannot be a uv group:
+# docling 2.130.0 pins typer>=0.19,<0.27, which conflicts with this project's
+# typer>=0.27.2, and uv resolves EVERY group together (even non-default ones) when
+# building the lock — so a `docling` group makes `uv sync` unsatisfiable even though CI
+# would never install it. The pin lives in the notebook, in
+# ledgion/ingest/parse_docling.DOCLING_PIN, and in each artifact's manifest.json.

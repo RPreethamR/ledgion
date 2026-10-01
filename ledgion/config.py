@@ -137,6 +137,29 @@ class ChunkConfig(BaseModel):
     unit: Literal["tokens", "chars"] = "tokens"
     # Hard rule from CLAUDE.md: chunks never span a page boundary.
     respect_page_boundary: bool = True
+    # Phase-8 table handling, only consulted when parser.backend == "docling".
+    # "flat"     — tables flattened to plain text and chunked like prose (isolates the
+    #              parser change from the table change).
+    # "markdown" — each table becomes its own chunk(s) as a markdown table, prefixed
+    #              with its caption + nearest heading/units line; an oversized table
+    #              splits by row groups with the header row repeated in each part.
+    # "linearized" — like markdown (standalone table chunks, same prefix/splitting) but
+    #              each row is one self-describing line "row label — col: val; col: val".
+    table_mode: Literal["flat", "markdown", "linearized"] = "flat"
+
+
+class ParserConfig(BaseModel):
+    """Which parser feeds ingestion, and where the Docling artifact lives.
+
+    "pymupdf" is the Phase-2 baseline (parse PDFs live). "docling" reads the
+    pre-parsed artifact produced once on Colab (notebooks/colab_docling_parse.ipynb)
+    from ``docling_dir`` — nothing Docling runs locally. Folded into config_hash, so a
+    parser change is a distinct run with its own results file and its own Qdrant
+    collection (set qdrant.collection_name per experiment so all three coexist).
+    """
+
+    backend: Literal["pymupdf", "docling"] = "pymupdf"
+    docling_dir: Path = Path("data/parsed/docling")
 
 
 class RetrievalConfig(BaseModel):
@@ -230,6 +253,7 @@ class Settings(BaseSettings):
     tickers: dict[str, str] = Field(default_factory=dict)
 
     paths: PathsConfig = Field(default_factory=PathsConfig)
+    parser: ParserConfig = Field(default_factory=ParserConfig)
     torch: TorchConfig = Field(default_factory=TorchConfig)
     embedding: EmbeddingConfig = Field(default_factory=EmbeddingConfig)
     reranker: RerankerConfig = Field(default_factory=RerankerConfig)

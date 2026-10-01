@@ -11,7 +11,7 @@ from pathlib import Path
 
 import typer
 
-from ledgion.config import load_config
+from ledgion.config import REPO_ROOT, load_config
 
 app = typer.Typer(add_completion=False, help="Ledgion — RAG QA over SEC filings.")
 
@@ -238,6 +238,30 @@ def analyze_complementarity(a: Path = _AOption, b: Path = _BOption) -> None:
         typer.secho(str(exc), fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1) from exc
     typer.echo(comp.format_report(result, a_report, b_report))
+
+
+_ResultsArgument = typer.Argument(
+    None, help="results/<hash>.json files to score (default: every results/*.json)."
+)
+
+
+@analyze_app.command("adoption")
+def analyze_adoption(results: list[Path] | None = _ResultsArgument) -> None:
+    """Apply the adoption rule (DECISIONS.md) to results files — read-only.
+
+    Reports each candidate's condition-1 (no regression on recall@10/ndcg@10/recall@50)
+    and condition-2 (a recall@10 or ndcg@10 gain > 0.02) verdict with deltas against
+    fixtures/baseline_metrics.json, lists dirty-tree results (excluded from adoption),
+    and names the adopted config (largest ndcg@10 gain among clean qualifiers, ties to
+    recall@10). Changes nothing."""
+    from ledgion.eval.adoption import analyze
+    from ledgion.eval.gate import load_baseline
+
+    files = list(results) if results else sorted((REPO_ROOT / "results").glob("*.json"))
+    if not files:
+        typer.secho("no results files to score", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+    typer.echo(analyze(files, load_baseline()))
 
 
 def main() -> None:

@@ -35,7 +35,21 @@ import bisect
 import hashlib
 from collections.abc import Callable, Sequence
 
+from ledgion.config import REPO_ROOT
+from ledgion.ingest.docling_artifact import (
+    artifact_path,
+    group_by_page,
+    load_elements,
+    render_table_flat,
+    table_linearized_lines,
+    table_markdown_parts,
+)
 from ledgion.interfaces import Chunk
+
+# A "context line" for a markdown table's prefix: a heading, or a short one-line text
+# such as the units line "(in millions, except per share data)". Anything longer is a
+# paragraph, not a label, and is left to chunk as prose.
+SHORT_LINE_CHARS = 120
 
 # Descending granularity. The empty string is the terminal fallback: split into
 # individual characters, reached only if a single run has none of the higher
@@ -234,6 +248,28 @@ class RecursiveChunker:
 
         return token_length
 
+    def count_tokens(self, text: str) -> int:
+        """Token count of a whole string in the configured unit (chars → ``len``).
+
+        Used by the table-aware chunker to size a markdown table (prefix + header +
+        rows) against ``size`` before deciding whether to split it by row groups.
+        """
+        if self.unit == "chars":
+            return len(text)
+        if not text:
+            return 0
+        tok = self._tokenizer()
+        return len(tok(text, add_special_tokens=False)["input_ids"])
+
+    def split_text(self, text: str) -> list[str]:
+        """Split one string into chunk texts each within ``size`` (configured unit).
+
+        The same recursive-span logic ``chunk`` applies per page, exposed for the
+        table-aware chunker to cap a single oversized table part (e.g. a giant
+        exhibit-index cell) that a row-group split cannot shrink on its own.
+        """
+        return [text[start:end] for start, end in self._chunk_page(text)]
+
     def _tokenizer(self):
         if self._tok is None:
             if self.tokenizer_model_id is None:
@@ -248,3 +284,294 @@ class RecursiveChunker:
             tok.model_max_length = int(1e9)
             self._tok = tok
         return self._tok
+
+
+def _resolve(path) -> object:
+    """Resolve a (possibly relative) config path against the repo root."""
+    from pathlib import Path
+
+    path = Path(path)
+    return path if path.is_absolute() else REPO_ROOT / path
+
+
+def _table_chunk_id(doc_id: str, page_num: int, element_index: int, part: int) -> str:
+    """Deterministic id for a table chunk. Keyed on the stable ``element_index`` from
+    the artifact and the split ``part`` — a different namespace from text chunks
+    (which key on a char offset), so the two can never collide."""
+    key = f"{doc_id}:{page_num}:t{element_index}:{part}"
+    return hashlib.sha256(key.encode()).hexdigest()[:16]
+
+
+class TableAwareChunker:
+    """A ``Chunker`` over the Docling artifact (see ``docling_artifact.py``).
+
+    Text elements chunk exactly as ``RecursiveChunker`` does (composed below, same
+    size/overlap/tokenizer). Tables follow ``chunk.table_mode``:
+
+    * **flat** — every element (tables flattened to plain text) is concatenated per
+      page and chunked recursively, so the only variable vs the PyMuPDF baseline is
+      the parser.
+    * **markdown** — tables are pulled out as their own chunk(s), each prefixed with
+      its caption and the nearest preceding heading/short line; an oversized table
+      splits by row groups with the header repeated in every part.
+
+    Conventions (both hard rules):
+
+    * **Every chunk carries exactly one page label.** A multi-page element is labeled
+      with its **first** page (its ``page_num``) — the same page FinanceBench labels
+      evidence on. So a paragraph flowing across a page break chunks entirely on the
+      page it starts, and no chunk straddles a boundary.
+    * **Tables never cross a page boundary** — a table is one element on one page, so
+      its chunks inherit that single page.
+
+    Imports nothing from Docling: the structured elements come from the JSONL artifact.
+    ``last_table_chunk_ids`` holds the ids emitted for tables in the most recent
+    ``chunk``/``chunk_elements`` call, so ingestion can report the table-chunk fraction.
+    """
+
+    def __init__(
+        self,
+        *,
+        size: int,
+        overlap: int,
+        unit: str = "tokens",
+        table_mode: str = "flat",
+        tokenizer_model_id: str | None = None,
+        tokenizer_revision: str | None = None,
+        docling_dir=None,
+        separators: Sequence[str] = DEFAULT_SEPARATORS,
+    ) -> None:
+        if table_mode not in ("flat", "markdown", "linearized"):
+            raise ValueError(f"unknown table_mode: {table_mode!r}")
+        self.size = size
+        self.table_mode = table_mode
+        self.docling_dir = docling_dir
+        # Compose the recursive splitter for all prose (and, in flat mode, the whole
+        # page). Sharing it means text chunks are byte-identical to the baseline's.
+        self._text = RecursiveChunker(
+            size=size,
+            overlap=overlap,
+            unit=unit,
+            tokenizer_model_id=tokenizer_model_id,
+            tokenizer_revision=tokenizer_revision,
+            separators=separators,
+        )
+        self.last_table_chunk_ids: set[str] = set()
+
+    @classmethod
+    def from_config(cls, cfg) -> TableAwareChunker:
+        if not cfg.chunk.respect_page_boundary:
+            raise NotImplementedError("respect_page_boundary=False is not supported")
+        return cls(
+            size=cfg.chunk.size,
+            overlap=cfg.chunk.overlap,
+            unit=cfg.chunk.unit,
+            table_mode=cfg.chunk.table_mode,
+            tokenizer_model_id=cfg.embedding.model_id,
+            tokenizer_revision=cfg.embedding.revision,
+            docling_dir=_resolve(cfg.parser.docling_dir),
+        )
+
+    # -- public contract -----------------------------------------------------
+
+    def chunk(
+        self,
+        doc_id: str,
+        pages: Sequence[tuple[int, str]],
+        *,
+        company: str,
+        ticker: str,
+        fiscal_year: int,
+        form_type: str,
+    ) -> list[Chunk]:
+        """Chunk one document from its Docling artifact.
+
+        Structured content comes from ``docling_dir/<doc_id>.docling.jsonl``, so the
+        ``pages`` argument (plain ``(page_num, text)`` pairs, used by text-only
+        chunkers) is accepted for ``Chunker``-protocol compatibility and ignored.
+        """
+        elements = load_elements(artifact_path(self.docling_dir, doc_id))
+        return self.chunk_elements(
+            doc_id,
+            elements,
+            company=company,
+            ticker=ticker,
+            fiscal_year=fiscal_year,
+            form_type=form_type,
+        )
+
+    def chunk_elements(
+        self,
+        doc_id: str,
+        elements: Sequence[dict],
+        *,
+        company: str,
+        ticker: str,
+        fiscal_year: int,
+        form_type: str,
+    ) -> list[Chunk]:
+        """Chunk a list of Docling element dicts (grouped by page internally).
+
+        The pure entry point — tests exercise it with synthetic elements, no file I/O.
+        """
+        meta = dict(company=company, ticker=ticker, fiscal_year=fiscal_year, form_type=form_type)
+        self.last_table_chunk_ids = set()
+        by_page = group_by_page(list(elements))
+        chunks: list[Chunk] = []
+        for page in sorted(by_page):
+            page_elements = by_page[page]
+            if self.table_mode == "flat":
+                chunks.extend(self._chunk_page_flat(doc_id, page, page_elements, meta))
+            else:  # markdown | linearized: prose chunks identical, tables standalone
+                chunks.extend(self._chunk_page_standalone_tables(doc_id, page, page_elements, meta))
+        return chunks
+
+    # -- flat mode -----------------------------------------------------------
+
+    def _chunk_page_flat(
+        self, doc_id: str, page: int, elements: Sequence[dict], meta: dict
+    ) -> list[Chunk]:
+        parts = [t for el in elements if (t := self._element_flat(el).strip())]
+        if not parts:
+            return []
+        page_text = "\n\n".join(parts)
+        return self._text.chunk(doc_id, [(page, page_text)], **meta)
+
+    @staticmethod
+    def _element_flat(element: dict) -> str:
+        if element.get("element_type") == "table":
+            return render_table_flat(element.get("table") or {})
+        return element.get("text") or ""
+
+    # -- markdown / linearized modes (tables as standalone chunks) -----------
+
+    def _chunk_page_standalone_tables(
+        self, doc_id: str, page: int, elements: Sequence[dict], meta: dict
+    ) -> list[Chunk]:
+        """Prose chunks exactly as flat's recursive prose (so they're identical across
+        markdown/linearized and hit the embedding cache); tables become their own
+        chunk(s), rendered per ``table_mode``."""
+        prose_parts: list[str] = []
+        table_chunks: list[Chunk] = []
+        context: str | None = None  # nearest preceding heading / short line
+        for el in elements:
+            if el.get("element_type") == "table":
+                prefix = self._table_prefix(el, context)
+                table_chunks.extend(self._table_chunks(doc_id, page, el, prefix, meta))
+                continue
+            text = (el.get("text") or "").strip()
+            if text:
+                prose_parts.append(text)
+            if self._is_context_line(el, text):
+                context = text
+
+        prose_chunks: list[Chunk] = []
+        if prose_parts:
+            prose_chunks = self._text.chunk(doc_id, [(page, "\n\n".join(prose_parts))], **meta)
+        return prose_chunks + table_chunks
+
+    @staticmethod
+    def _is_context_line(element: dict, text: str) -> bool:
+        if not text:
+            return False
+        etype = element.get("element_type")
+        if etype == "heading":
+            return True
+        # A short, single-line text is a label (a units line, a small caption).
+        return etype == "text" and len(text) <= SHORT_LINE_CHARS and "\n" not in text
+
+    @staticmethod
+    def _table_prefix(element: dict, context: str | None) -> str:
+        """Caption + nearest preceding heading/short line. Docling usually captures a
+        financial statement's title as the table caption and the units line as the
+        short text just above it, so together they restore what a table needs to be
+        interpretable. De-duplicated in case the caption and context coincide."""
+        caption = ((element.get("table") or {}).get("caption") or "").strip()
+        lines: list[str] = []
+        for line in (caption, context):
+            if line and line not in lines:
+                lines.append(line)
+        return "\n".join(lines)
+
+    def _table_chunks(
+        self, doc_id: str, page: int, element: dict, prefix: str, meta: dict
+    ) -> list[Chunk]:
+        if self.table_mode == "linearized":
+            texts = self._linearized_table_texts(element, prefix)
+        else:
+            texts = self._markdown_table_texts(element, prefix)
+
+        # Guarantee every part fits the budget. A single huge cell (an exhibit-index
+        # row, say) can exceed `size`, and a row-group split can't shrink one row — the
+        # embedder would then raise on a >512-token input. Split any oversized part as
+        # plain text so no table chunk ever exceeds the budget the recursive chunker
+        # already honours for prose.
+        texts = self._cap_parts(texts)
+
+        chunks: list[Chunk] = []
+        for part, text in enumerate(texts):
+            cid = _table_chunk_id(doc_id, page, element.get("element_index", 0), part)
+            self.last_table_chunk_ids.add(cid)
+            chunks.append(Chunk(chunk_id=cid, doc_id=doc_id, page_num=page, text=text, **meta))
+        return chunks
+
+    def _markdown_table_texts(self, element: dict, prefix: str) -> list[str]:
+        """A table as markdown: the header block (+prefix) repeats in every split part."""
+        table = element.get("table") or {}
+        header_lines, body_lines = table_markdown_parts(table)
+        if not header_lines and not body_lines:
+            # Degenerate/empty grid: fall back to the stored plain-text rendering so
+            # the table is still represented rather than silently dropped.
+            fallback = (element.get("text") or "").strip()
+            return [f"{prefix}\n{fallback}".strip()] if fallback or prefix else []
+        base = f"{prefix}\n" + "\n".join(header_lines) if prefix else "\n".join(header_lines)
+        whole = base + ("\n" + "\n".join(body_lines) if body_lines else "")
+        if not body_lines or self._text.count_tokens(whole) <= self.size:
+            return [whole]
+        return self._split_table_rows(base, body_lines)
+
+    def _linearized_table_texts(self, element: dict, prefix: str) -> list[str]:
+        """A table as one self-describing line per row. Each line carries its own column
+        labels, so only the caption/heading ``prefix`` repeats across split parts."""
+        lines = table_linearized_lines(element.get("table") or {})
+        if not lines:
+            fallback = (element.get("text") or "").strip()
+            return [f"{prefix}\n{fallback}".strip()] if fallback or prefix else []
+        whole = self._compose(prefix, lines)
+        if self._text.count_tokens(whole) <= self.size:
+            return [whole]
+        return self._split_table_rows(prefix, lines)
+
+    @staticmethod
+    def _compose(base: str, lines: Sequence[str]) -> str:
+        """Join ``base`` (a possibly-empty prefix/header block) with ``lines``."""
+        body = "\n".join(lines)
+        return f"{base}\n{body}" if base else body
+
+    def _cap_parts(self, texts: Sequence[str]) -> list[str]:
+        """Recursively split any part still over ``size`` (a single giant cell)."""
+        capped: list[str] = []
+        for text in texts:
+            if self._text.count_tokens(text) > self.size:
+                capped.extend(self._text.split_text(text) or [text])
+            else:
+                capped.append(text)
+        return capped
+
+    def _split_table_rows(self, base: str, body_lines: Sequence[str]) -> list[str]:
+        """Greedily pack rows into parts so each ``base`` + its rows stays within
+        ``size``. ``base`` (the markdown header block, or the linearized prefix — which
+        may be empty) is repeated in every part. A single row that alone overflows is
+        emitted as its own part (a row can't be split; ``_cap_parts`` handles it)."""
+        parts: list[str] = []
+        current: list[str] = []
+        for row in body_lines:
+            trial = self._compose(base, [*current, row])
+            if current and self._text.count_tokens(trial) > self.size:
+                parts.append(self._compose(base, current))
+                current = [row]
+            else:
+                current.append(row)
+        if current:
+            parts.append(self._compose(base, current))
+        return parts

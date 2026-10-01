@@ -80,3 +80,23 @@ def test_cache_returns_identical_vectors_on_second_call(tmp_path):
     # Second call is served from disk -> byte-identical, and counted as a hit.
     assert embedder.cache_hits == 1
     assert np.array_equal(first[0], second[0])
+
+
+def test_oversized_input_raises_with_length_and_limit(tmp_path):
+    pytest.importorskip("huggingface_hub")  # skip cleanly on the torch-free CI env
+    cfg = load_config()
+    if not _model_cached(cfg.embedding.model_id, cfg.embedding.revision):
+        pytest.skip("bge-base not in local HF cache; skipping to stay offline")
+
+    embedder = BGEEmbedder.from_config(cfg)
+    embedder.cache_dir = tmp_path  # isolate from the real cache
+    # ~600 tokens ("word" is one bge token), well over the 512 limit -> must raise,
+    # never truncate. The message names the chunk id, the length, and the limit.
+    oversized = "word " * 600
+    with pytest.raises(ValueError, match="over the embedding.max_seq_length limit of 512"):
+        embedder.embed_documents([oversized], ids=["CHUNK_XYZ"])
+    try:
+        embedder.embed_documents([oversized], ids=["CHUNK_XYZ"])
+    except ValueError as exc:
+        assert "CHUNK_XYZ" in str(exc)  # the offending chunk is identified
+        assert "600" in str(exc) or "602" in str(exc)  # its token length is reported
