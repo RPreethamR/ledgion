@@ -124,9 +124,50 @@ def _print_eval_summary(report: dict) -> None:
         typer.echo(f"{group:<8} {cells}  {counts.get(group, 0):>4}")
 
     tier2 = report.get("tier2")
-    if tier2 and tier2.get("metrics"):
-        judged = " ".join(f"{k}={v:.4f}" for k, v in sorted(tier2["metrics"].items()))
-        typer.echo(f"tier2    {judged}")
+    if tier2 and tier2.get("report"):
+        _print_tier2_summary(tier2)
+
+
+def _pct(value: float | None) -> str:
+    return "-" if value is None else f"{value:.1%}"
+
+
+def _num(value: float | None) -> str:
+    return "-" if value is None else f"{value:.4f}"
+
+
+def _print_tier2_summary(tier2: dict) -> None:
+    """Print the Tier 2 judged table: correctness/faithfulness/citation validity per group,
+    each beside its n, plus total judge tokens. Means are never shown without their n."""
+    rep = tier2.get("report", {})
+    prov = tier2.get("provenance", {})
+    corr = rep.get("correctness", {})
+    faith = rep.get("faithfulness", {})
+    cv = rep.get("citation_validity", {})
+    typer.echo("")
+    typer.echo(
+        f"Tier 2 (judged)  ·  {tier2.get('completed', 0)}/{tier2.get('total', 0)} scored  ·  "
+        f"judge {prov.get('judge', {}).get('model', '?')}  ·  "
+        f"gen ctx {prov.get('generator_context_size', '?')}"
+    )
+    typer.echo(
+        f"{'group':<8} {'correct':>8} {'incorr':>8} {'refused':>8} "
+        f"{'faith':>8} {'uncited':>8} {'cit_val':>8} {'n':>4}"
+    )
+    for group in ("overall", "numeric", "prose"):
+        if group not in corr:
+            continue
+        c, f, v = corr[group], faith.get(group, {}), cv.get(group, {})
+        typer.echo(
+            f"{group:<8} {_pct(c['pct_correct']):>8} {_pct(c['pct_incorrect']):>8} "
+            f"{_pct(c['pct_refused']):>8} {_num(f.get('mean')):>8} {f.get('uncited', 0):>8} "
+            f"{_num(v.get('mean')):>8} {c['n']:>4}"
+        )
+    tokens = rep.get("tokens", {})
+    typer.echo(
+        f"judge tokens: prompt {tokens.get('prompt', 0)}  "
+        f"completion {tokens.get('completion', 0)}  total {tokens.get('total', 0)}"
+    )
 
 
 @app.command("eval")
@@ -262,6 +303,67 @@ def analyze_adoption(results: list[Path] | None = _ResultsArgument) -> None:
         typer.secho("no results files to score", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1)
     typer.echo(analyze(files, load_baseline()))
+
+
+_Tier2ResultsArgument = typer.Argument(
+    ..., help="A Tier 2 results/<hash>.json (must carry a tier2 block)."
+)
+_SheetOutOption = typer.Option(..., "--out", help="Path to write the blind grading CSV.")
+_SheetInOption = typer.Option(..., "--sheet", help="The completed grading CSV to score.")
+
+
+def _tier2_records(results: Path) -> list[dict]:
+    """Load a results file and return its Tier 2 per-question records, or exit cleanly."""
+    from ledgion.eval.runner import load_report
+
+    report = load_report(results)
+    records = report.get("tier2", {}).get("results")
+    if not records:
+        typer.secho(f"{results} has no Tier 2 results (run `ledgion eval --tier 2` first)",
+                    fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+    return records
+
+
+@analyze_app.command("grading-sheet")
+def analyze_grading_sheet(
+    results: Path = _Tier2ResultsArgument, out: Path = _SheetOutOption
+) -> None:
+    """Export a blind hand-grading CSV from a Tier 2 results file.
+
+    The judge's verdicts are deliberately omitted (grading next to them anchors the
+    grader); refusals are pre-filled since they're deterministic. Read-only."""
+    from ledgion.eval.grading import export_grading_sheet
+
+    records = _tier2_records(results)
+    to_grade = export_grading_sheet(records, out)
+    typer.echo(
+        f"wrote {out}  ({len(records)} rows, {to_grade} to grade; refusals pre-filled, "
+        "no judge verdicts)"
+    )
+
+
+@analyze_app.command("judge-agreement")
+def analyze_judge_agreement(
+    results: Path = _Tier2ResultsArgument, sheet: Path = _SheetInOption
+) -> None:
+    """Join a completed grading sheet to the judge's verdicts (on qid + answer hash) and
+    report agreement, a confusion matrix, Cohen's kappa, and every disagreement. Fails if
+    any answer text differs from what was graded. Read-only."""
+    from ledgion.eval.grading import (
+        AgreementError,
+        format_agreement,
+        judge_agreement,
+        read_grading_sheet,
+    )
+
+    records = _tier2_records(results)
+    try:
+        report = judge_agreement(read_grading_sheet(sheet), records)
+    except AgreementError as exc:
+        typer.secho(str(exc), fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(format_agreement(report))
 
 
 def main() -> None:

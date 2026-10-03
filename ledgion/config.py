@@ -201,12 +201,52 @@ class GenerationConfig(BaseModel):
     # deterministic, temperature-0 extraction task); -1 lets the model choose;
     # a positive int caps it; None omits the field entirely (model default).
     thinking_budget: int | None = 0
+    # How many retrieved chunks the generator is handed. On the default dense path the
+    # reranker is off, so today the generator sees ALL retrieval.top_k chunks (50); this
+    # makes that explicit and tunable without coupling it to the retrieval pool depth.
+    # The serving/eval path slices contexts[:context_size]; default 50 keeps the current
+    # behaviour. Folded into the generation signature (so a change re-generates) and
+    # recorded in Tier 2 provenance.
+    context_size: int = 50
     # Bounded retry with exponential backoff for *transient* API failures (HTTP
     # 429/5xx, e.g. "model overloaded"). Delay before attempt n is
     # retry_base_delay_s * 2**n. Non-transient errors (bad key, unknown model)
     # fail immediately — retrying them only delays the inevitable.
     max_retries: int = 5
     retry_base_delay_s: float = 2.0
+
+
+class JudgeConfig(BaseModel):
+    """The Tier 2 LLM judge: Groq's gpt-oss via an OpenAI-compatible endpoint.
+
+    Tier 2 only (never gates a build, never runs in CI). The Groq free tier caps
+    tokens hard (8k/min, 200k/day), so every setting here is about not wasting judge
+    tokens: ``temperature=0`` for determinism, ``reasoning_effort="low"`` to keep the
+    model's hidden reasoning (which counts against both the caps and ``max_tokens``)
+    short, and ``max_tokens`` sized with headroom so a legitimate verdict is never cut
+    off — a response truncated by the limit is raised, not cached (the Phase-3 guard).
+    The ragas run settings (``max_workers``/``max_retries``/``max_wait``) make judging
+    sequential and patient; evaluation raises on error rather than returning NaN.
+    """
+
+    model: str = "openai/gpt-oss-20b"
+    base_url: str = "https://api.groq.com/openai/v1"
+    api_key_env: str = "GROQ_API_KEY"  # name of the env var holding the secret
+    temperature: float = 0.0
+    # gpt-oss is a reasoning model; "low" keeps hidden reasoning (and its token cost)
+    # modest for this short-verdict task.
+    reasoning_effort: Literal["low", "medium", "high"] = "low"
+    # Headroom for hidden reasoning + the (small) structured verdict. A response that
+    # still hits this limit is truncated → raised, never cached.
+    max_tokens: int = 4096
+    # ragas RunConfig: one worker (sequential, so a cap is hit predictably, not mid-
+    # parallel-batch), 3 retries, up to 60s backoff. Evaluation raises on error.
+    max_workers: int = 1
+    max_retries: int = 3
+    max_wait: int = 60
+    # The versioned correctness rubric. Its text hash is part of the judgment cache key
+    # and the Tier 2 provenance, so editing the rubric invalidates cached verdicts.
+    rubric_path: Path = Path("config/judge/correctness_rubric.md")
 
 
 class TracingConfig(BaseModel):
@@ -263,6 +303,7 @@ class Settings(BaseSettings):
     fusion: FusionConfig = Field(default_factory=FusionConfig)
     qdrant: QdrantConfig = Field(default_factory=QdrantConfig)
     generation: GenerationConfig = Field(default_factory=GenerationConfig)
+    judge: JudgeConfig = Field(default_factory=JudgeConfig)
     tracing: TracingConfig = Field(default_factory=TracingConfig)
     eval: EvalConfig = Field(default_factory=EvalConfig)
 
