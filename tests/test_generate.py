@@ -14,8 +14,13 @@ from types import SimpleNamespace
 import pytest
 from google.genai import errors
 
+from ledgion.config import load_config
 from ledgion.generate.citations import validate_citations
-from ledgion.generate.gemini import GeminiGenerator
+from ledgion.generate.gemini import (
+    GeminiGenerator,
+    _is_daily_quota_exhausted,
+    generation_signature,
+)
 from ledgion.generate.prompt import build_user_prompt
 from ledgion.interfaces import Chunk, RetrievedChunk
 
@@ -59,12 +64,33 @@ def test_validate_citations_drops_fabricated_keeps_real():
     assert check.validity == 0.5
 
 
+def test_generation_signature_ignores_unrelated_config_but_tracks_generation():
+    # The generation cache keys on this signature, not config_hash: an unrelated knob
+    # change must reuse cached answers, a generation-knob change must bypass them.
+    base = load_config()
+
+    # An unrelated knob (fusion smoothing, and even the Tier 2 judge) -> SAME signature.
+    unrelated = base.model_copy(
+        update={
+            "fusion": base.fusion.model_copy(update={"rrf_k": 999}),
+            "judge": base.judge.model_copy(update={"model": "something/else"}),
+        }
+    )
+    assert generation_signature(unrelated) == generation_signature(base)
+
+    # A generation knob (temperature) -> DIFFERENT signature.
+    changed = base.model_copy(
+        update={"generation": base.generation.model_copy(update={"temperature": 0.7})}
+    )
+    assert generation_signature(changed) != generation_signature(base)
+
+
 def test_generation_cache_skips_second_api_call(tmp_path):
     ids = ["a1b2c3d4e5f60718", "0011ffaa0011ffaa"]
     contexts = _contexts(ids)
     gen = GeminiGenerator(
         model="gemini-test",
-        config_hash="cfghash",
+        gen_signature="gensig",
         cache_dir=tmp_path,
         api_key=None,
     )
@@ -105,7 +131,7 @@ def _generator(tmp_path):
     # retry_base_delay_s=0 so the retry tests don't actually sleep.
     return GeminiGenerator(
         model="gemini-test",
-        config_hash="cfghash",
+        gen_signature="gensig",
         cache_dir=tmp_path,
         api_key=None,
         max_retries=3,
@@ -140,6 +166,47 @@ def test_does_not_retry_non_transient_error(tmp_path):
     with pytest.raises(RuntimeError):
         gen._with_retries(bad_request)
     assert attempts["n"] == 1
+
+
+def test_detects_per_day_vs_per_minute_quota():
+    per_day = Exception("429 RESOURCE_EXHAUSTED GenerateRequestsPerDayPerProjectPerModel-FreeTier")
+    per_min = Exception("429 RESOURCE_EXHAUSTED GenerateRequestsPerMinutePerProjectPerModel")
+    assert _is_daily_quota_exhausted(per_day)
+    assert not _is_daily_quota_exhausted(per_min)
+
+
+def test_does_not_retry_daily_quota_cap(tmp_path):
+    gen = _generator(tmp_path)
+    attempts = {"n": 0}
+
+    def daily_cap() -> str:
+        attempts["n"] += 1
+        raise errors.ClientError(
+            429,
+            {"error": {"message": "exceeded GenerateRequestsPerDayPerProjectPerModel-FreeTier"}},
+        )
+
+    # A per-DAY cap won't clear for hours and each retry burns the day's quota: fail fast.
+    with pytest.raises(RuntimeError):
+        gen._with_retries(daily_cap)
+    assert attempts["n"] == 1
+
+
+def test_retries_per_minute_rate_limit(tmp_path):
+    gen = _generator(tmp_path)  # max_retries=3, no real sleep
+    attempts = {"n": 0}
+
+    def per_minute() -> str:
+        attempts["n"] += 1
+        if attempts["n"] < 2:
+            raise errors.ClientError(
+                429, {"error": {"message": "GenerateRequestsPerMinutePerProjectPerModel"}}
+            )
+        return '{"answer": "ok", "citations": [], "insufficient_evidence": true}'
+
+    out = gen._with_retries(per_minute)
+    assert attempts["n"] == 2  # a per-minute 429 DOES retry, then succeeds
+    assert json.loads(out)["answer"] == "ok"
 
 
 def _fake_response(finish_reason: str, *, thoughts: int = 0):

@@ -10,12 +10,17 @@ context -> grounded ``Answer``. Three things matter here.
 * **Determinism.** ``temperature=0`` (from config), and never a local model in
   the serving path (CLAUDE.md) — generation is a Gemini API call.
 * **Cache before network.** Responses are cached on disk keyed by
-  ``sha256(question + config_hash + retrieved_chunk_ids)``. A re-run with the
-  same question, config, and retrieved context reads the cached JSON and makes
-  **no** API call — so eval sweeps and repeated ``ask``s don't burn quota. The
-  key includes ``config_hash`` because a different model / temperature / prompt is
-  a different answer, and the chunk_ids because an answer is only valid for the
-  exact context it saw.
+  ``sha256(question + gen_signature + retrieved_chunk_ids)``. A re-run with the
+  same question, generation settings, and retrieved context reads the cached JSON
+  and makes **no** API call — so eval sweeps and repeated ``ask``s don't burn quota.
+  The key uses a *generation signature* — a hash of the generation model and its
+  settings plus the prompt template (see ``generation_signature``) — **not**
+  ``config_hash``: a different model / temperature / prompt is a different answer, but
+  a change to an unrelated knob (retrieval fusion params, the Tier 2 judge, eval
+  settings) must **not** invalidate an answer that would be byte-identical. The
+  chunk_ids are in the key because an answer is only valid for the exact context it
+  saw (and ``generation.context_size`` is reflected there — it decides which chunk_ids
+  reach the generator).
 
 After decoding, citations are validated against the context actually sent (see
 citations.py): fabricated ids are dropped, kept ids are resolved to their
@@ -35,17 +40,55 @@ from pathlib import Path
 from pydantic import BaseModel
 
 from ledgion.config import Settings
-from ledgion.config import config_hash as compute_config_hash
 from ledgion.generate.citations import validate_citations
 from ledgion.generate.prompt import SYSTEM_INSTRUCTION, build_user_prompt, context_chunk_ids
 from ledgion.interfaces import Answer, RetrievedChunk
 
 logger = logging.getLogger(__name__)
 
+
+def generation_signature(cfg: Settings) -> str:
+    """A stable hash of everything that defines the *answer* for a given context.
+
+    This is the generation cache's identity: the provider, model, and decoding
+    settings, plus the prompt template (the system instruction). It deliberately
+    excludes retrieval, fusion, reranking, judge, and eval knobs — those do not change
+    what the model would answer for a fixed question + fixed context, so they must not
+    bust the generation cache (changing the Tier 2 judge must never re-generate an
+    answer). Which chunks reach the generator (``generation.context_size``) is captured
+    separately, by the chunk_ids folded into each cache key.
+    """
+    g = cfg.generation
+    payload = json.dumps(
+        {
+            "provider": g.provider,
+            "model": g.model,
+            "temperature": g.temperature,
+            "max_output_tokens": g.max_output_tokens,
+            "thinking_budget": g.thinking_budget,
+            "prompt_template": SYSTEM_INSTRUCTION,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
 # HTTP status codes worth retrying: rate limit + server-side/overload. Everything
 # else (bad key 401/403, unknown model 404, malformed request 400) is a permanent
 # failure that retrying only delays.
 _TRANSIENT_CODES = frozenset({429, 500, 502, 503, 504})
+
+
+def _is_daily_quota_exhausted(exc: object) -> bool:
+    """True for a 429 whose quota is the per-DAY free-tier cap (quotaId
+    ``...PerDayPerProjectPerModel``) rather than a per-minute rate limit.
+
+    A per-minute 429 clears in seconds, so backing off and retrying is right. A per-day
+    cap won't clear for hours — retrying only delays the inevitable AND, on the free
+    tier, each retry burns another of the day's scarce requests. So we fail fast on it,
+    which also lets the Tier-2 loop stop cleanly and resume next day from the cache.
+    """
+    return "PerDay" in str(exc)
 
 
 class _AnswerSchema(BaseModel):
@@ -65,7 +108,7 @@ class GeminiGenerator:
         self,
         *,
         model: str,
-        config_hash: str,
+        gen_signature: str,
         cache_dir: Path,
         api_key: str | None = None,
         temperature: float = 0.0,
@@ -75,7 +118,9 @@ class GeminiGenerator:
         retry_base_delay_s: float = 2.0,
     ) -> None:
         self.model = model
-        self.config_hash = config_hash
+        # Content-addressed on generation identity, NOT config_hash (see module docstring
+        # and generation_signature): unrelated config changes must not invalidate answers.
+        self.gen_signature = gen_signature
         self.cache_dir = Path(cache_dir)
         self.api_key = api_key
         self.temperature = temperature
@@ -90,11 +135,13 @@ class GeminiGenerator:
 
     @classmethod
     def from_config(cls, cfg: Settings) -> GeminiGenerator:
-        # config_hash folds every knob (model, temperature, chunking, etc.) into
-        # the cache key: change any of them and cached answers are bypassed.
+        # The generation signature folds only the generation model/settings + prompt
+        # template into the cache key (see generation_signature): change the model,
+        # temperature, or prompt and cached answers are bypassed; change an unrelated
+        # knob (retrieval, judge, eval) and they are reused.
         return cls(
             model=cfg.generation.model,
-            config_hash=compute_config_hash(cfg),
+            gen_signature=generation_signature(cfg),
             cache_dir=Path(cfg.paths.cache_dir) / "generation",
             api_key=os.environ.get(cfg.generation.api_key_env),
             temperature=cfg.generation.temperature,
@@ -144,7 +191,7 @@ class GeminiGenerator:
     def _cache_key(self, question: str, chunk_ids: Sequence[str]) -> str:
         # NUL separators so field boundaries can't be forged by concatenation
         # (same rationale as the embedding cache key in ingest/embed.py).
-        payload = "\x00".join([question, self.config_hash, *chunk_ids])
+        payload = "\x00".join([question, self.gen_signature, *chunk_ids])
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     def _cache_load(self, key: str) -> str | None:
@@ -242,8 +289,9 @@ class GeminiGenerator:
 
         Retries only 429/5xx (overload, rate limit) — the failures that clear on
         their own. A non-transient error (bad key, unknown model, malformed
-        request) or an exhausted retry budget is translated to a ``RuntimeError``,
-        so the CLI prints one clean line instead of an SDK stack trace.
+        request), a per-DAY quota cap (which won't clear for hours), or an exhausted
+        retry budget is translated to a ``RuntimeError``, so the CLI prints one clean
+        line instead of an SDK stack trace.
         """
         from google.genai import errors
 
@@ -252,7 +300,10 @@ class GeminiGenerator:
                 return call()
             except errors.APIError as exc:
                 code = getattr(exc, "code", None)
-                if code not in _TRANSIENT_CODES or attempt == self.max_retries:
+                # A per-day free-tier cap is not worth retrying — and each retry would
+                # burn another of the day's requests (see _is_daily_quota_exhausted).
+                daily_cap = code == 429 and _is_daily_quota_exhausted(exc)
+                if code not in _TRANSIENT_CODES or daily_cap or attempt == self.max_retries:
                     status = getattr(exc, "status", "") or ""
                     raise RuntimeError(f"Gemini API error ({code} {status}): {exc}") from exc
                 delay = self.retry_base_delay_s * (2**attempt)

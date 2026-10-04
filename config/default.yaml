@@ -94,8 +94,24 @@ generation:
   max_output_tokens: 2048
   api_key_env: GEMINI_API_KEY
   thinking_budget: 0        # 0 disables thinking; it otherwise eats max_output_tokens
+  context_size: 50          # chunks handed to the generator (default dense path passes all top_k)
   max_retries: 5            # retry transient 429/5xx (e.g. model overloaded)
   retry_base_delay_s: 2.0   # backoff before attempt n = retry_base_delay_s * 2**n
+
+# Tier 2 LLM judge (Groq gpt-oss via an OpenAI-compatible endpoint). Tier 2 only —
+# never gates a build, never runs in CI. Free-tier token caps are the binding
+# constraint, so these settings exist to not waste judge tokens (see JudgeConfig).
+judge:
+  model: openai/gpt-oss-20b
+  base_url: https://api.groq.com/openai/v1
+  api_key_env: GROQ_API_KEY
+  temperature: 0.0
+  reasoning_effort: low     # gpt-oss hidden reasoning counts against the caps + max_tokens
+  max_tokens: 4096          # headroom; a response truncated by this limit is raised, not cached
+  max_workers: 1            # ragas RunConfig: sequential, so a token cap is hit predictably
+  max_retries: 3
+  max_wait: 60
+  rubric_path: config/judge/correctness_rubric.md   # text hash → judgment cache key + provenance
 
 tracing:
   enabled: false

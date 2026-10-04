@@ -410,3 +410,100 @@ Two guards added this phase:
 - The embedder RAISES on any input over max_seq_length (was a log-only
   tripwire that never actually truncated) — an oversized chunk is a chunker
   bug, now surfaced with its chunk id rather than silently truncated.
+
+## Phase 4 — Tier 2 (judged), Part A: built + tested offline
+Judge = Groq openai/gpt-oss-20b (OpenAI-compatible), temp 0, reasoning_effort
+low. Free-tier token caps (8k/min, 200k/day) are the binding constraint — the
+whole design is "don't waste a judge token, never silently drop a sample."
+
+Dep: ragas==0.4.3 in a tier2 group (NOT default-groups, NOT CI). It pins typer
+with no upper bound, so uv lock resolves the whole project (docling couldn't —
+it pins typer<0.27). Pulls 55 pkgs (~400-500MB, no torch/transformers); nudges
+rich 15→14.3.4. Not installed yet; needed only for Part B (Groq calls).
+
+Metrics: refusal (deterministic, from insufficient_evidence; never judged,
+counted as not-correct a la FinanceBench), citation_validity (unchanged),
+faithfulness (ragas, context = validly-CITED chunk texts only; a non-refusal
+with no valid citation = uncited, scores 0, counted separately), correctness
+(bespoke BINARY verdict vs a versioned rubric — NOT ragas answer_correctness;
+% over ALL questions). Every mean reported with its n; never a NaN, never a
+shrunk denominator.
+
+Caches content-addressed, decoupled from config_hash:
+- judgment key = (question, gold, answer text, cited chunk texts, judge_sig);
+  judge_sig = judge model/settings + rubric hash + ragas version. Edit the
+  rubric → re-judge; change an unrelated knob → cache hit (no tokens burned).
+- generation cache re-keyed off config_hash onto a generation signature (gen
+  model/settings + prompt template) + chunk_ids → changing the judge never
+  regenerates an answer.
+Trade: adding judge/context_size config shifts every config_hash (new dump
+fields) — fine, nothing is hash-keyed (gate reads baseline_metrics.json;
+analyze/compare take paths).
+
+Quota discipline: score one question at a time, cache each result as it lands;
+a failure after retries (incl. daily cap) stops with "Scored X/N — rerun
+resumes from cache"; a truncated verdict (finish_reason=length) raises before
+parse/cache (same as the Gemini MAX_TOKENS guard).
+
+Generator context: default dense path feeds the generator ALL top_k=50 chunks
+(reranker off → no trim). Made explicit as generation.context_size=50 (behavior
+unchanged); recorded in Tier-2 provenance.
+
+Hand-grading: ledgion analyze grading-sheet (blind CSV, NO judge verdicts,
+refusals pre-filled) + judge-agreement (joins on qid+answer_hash, FAILS on any
+answer-text drift; reports agreement, confusion matrix, Cohen's kappa, every
+disagreement + the judge's reason).
+
+Tests: 139 passed (11 new/changed), all offline with a fake judge, no Groq.
+STOP: rubric (config/judge/correctness_rubric.md) awaits approval before any
+token is spent; Part B (run baseline_dense, report table + tokens, export
+grading sheet) is gated on it.
+
+## Phase 4 — Tier 2, Part B: partial (Gemini generation cap, not the judge)
+Rubric approved; tier2 group installed (venv 982→1175MB, +193MB — far under the
+estimate). ragas 0.4.3 FAILS to import against langchain 1.x (it imports
+langchain_community.chat_models.vertexai.ChatVertexAI, removed in 1.0); pinned
+langchain-core<1.0 in the tier2 group to cascade the stack to 0.3.x. Live smoke
+test green (correct→correct, wrong#→incorrect, faithfulness 1.0).
+
+Ran on baseline_dense: stopped at 11/30. Bottleneck is NOT Groq (judge used
+~55k of 200k/day tokens) — it's GEMINI generation free tier: 20 requests/day
+for gemini-3.8-flash (retries count too), resets ~3h47m. Partial (11 Qs):
+  overall  correct 9 (.818)  incorrect 1 (.091)  refused 1 (.091)
+           faithfulness .968 (n=10)  citation_validity 1.0 (n=10)
+  numeric  correct 5/6 (.833)  faithfulness .947
+  prose    correct 4/5 (.80)   refused 1   faithfulness 1.0
+Progress is in .cache (content-addressed); no results file written (crashed
+pre-write). Rerun after the Gemini reset resumes: 11 cache-hit, 19 to generate
+(fits one 20/day window), then judge + write + grading sheet.
+
+Fix from this run: run_tier2 now wraps GENERATION failures in the same clean
+"Scored X/N — rerun resumes" stop as judge failures (a Gemini daily-cap 429 had
+thrown a raw traceback). First read of Tier-2 quality: correctness ~0.8 and
+faithfulness ~0.97 on the scored subset — the judge agrees the dense baseline's
+answers are well-grounded; correctness is the headline to confirm on the full 30.
+
+## Phase 4 — Tier 2, Part B: COMPLETE (30/30, baseline_dense)
+Took 4 Gemini windows (2 free keys' 20/day caps + overload 503s burned requests,
+incl. retries) — the generator, not the Groq judge, was the whole bottleneck.
+The content-addressed caches made each resume free for the already-done Qs. A
+second generator fix landed mid-way: a per-DAY 429 now fails fast (it won't clear
+for hours and each retry wastes a request); a per-minute 429 still retries.
+
+RESULTS (results/a10c4c4e...json; gen gemini-3.8-flash, judge gpt-oss-20b, ctx 50):
+  group     correct  incorr  refused   faith   cit_val   n
+  overall    76.7%   13.3%   10.0%    .8879    1.0000   30
+  numeric    81.2%   18.8%    0.0%    .8380    1.0000   16
+  prose      71.4%    7.1%   21.4%    .9606    1.0000   14
+Judge tokens: 112,615 prompt + 36,383 completion = 148,998 total.
+Refusals (3) count as not-correct (FinanceBench-style); 0 uncited answers.
+
+Read: citation validity 1.0 (the generator never fabricates a cited id) and
+faithfulness .89 say answers are well-grounded in what they cite; correctness
+76.7% is the headline — numeric higher (81%) than prose (71%), and all 3 refusals
+are prose (the generator abstains when dense retrieval buries the evidence, which
+matches Tier-1's weaker prose recall@10 .46). Faithfulness numeric .84 < prose .96:
+numeric answers lean on tables where ragas's claim-by-claim NLI is stricter.
+NOTE: judged numbers pending human-grading confirmation — grading sheet exported
+to grading_baseline_dense.csv (27 to grade, 3 refusals pre-filled, no judge
+verdicts); run `ledgion analyze judge-agreement` after grading for kappa.

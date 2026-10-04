@@ -475,19 +475,48 @@ def run(cfg: Settings, *, tier: int, out_dir: Path | None = None) -> Path:
             raise SystemExit(
                 "Tier 2 is judged and off by default; set eval.ragas_enabled: true to run it."
             )
-        # Lazy: keeps ragas + the generator out of the Tier 1 path entirely.
-        from ledgion.eval.tier2 import ragas_judge, run_tier2
+        # Lazy: keeps ragas + openai + the generator out of the Tier 1 path entirely.
+        from ledgion.eval.judge import (
+            build_judge,
+            judge_signature,
+            load_rubric,
+            ragas_version,
+            rubric_hash,
+        )
+        from ledgion.eval.tier2 import run_tier2
         from ledgion.generate.gemini import GeminiGenerator
+
+        # The judgment cache keys on this signature (judge model/settings + rubric hash
+        # + ragas version), NOT config_hash — so an unrelated knob never re-judges.
+        rubric_text = load_rubric(cfg)
+        ragas_ver = ragas_version()
+        jsig = judge_signature(cfg, rubric_text=rubric_text, ragas_ver=ragas_ver)
 
         tier2_result = run_tier2(
             golden,
             retriever,
             GeminiGenerator.from_config(cfg),
-            ragas_judge(cfg),
-            top_k=cfg.retrieval.top_k,
+            build_judge(cfg, rubric_text),
+            context_size=cfg.generation.context_size,
             cache_dir=Path(cfg.paths.cache_dir) / "tier2",
-            config_hash=config_hash(cfg),
+            judge_signature=jsig,
         )
+        # Full Tier 2 provenance: everything needed to tie a number to how it was judged.
+        tier2_result["provenance"] = {
+            "ragas_version": ragas_ver,
+            "judge": {
+                "model": cfg.judge.model,
+                "base_url": cfg.judge.base_url,
+                "temperature": cfg.judge.temperature,
+                "reasoning_effort": cfg.judge.reasoning_effort,
+                "max_tokens": cfg.judge.max_tokens,
+            },
+            "rubric_hash": rubric_hash(rubric_text),
+            "rubric_path": str(cfg.judge.rubric_path),
+            "generation_model": cfg.generation.model,
+            "generator_context_size": cfg.generation.context_size,
+            "judge_signature": jsig,
+        }
 
     report = build_report(
         cfg,

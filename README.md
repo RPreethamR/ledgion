@@ -4,8 +4,14 @@
 
 Ledgion is a retrieval-augmented QA system over SEC filings (10-K/10-Q), benchmarked
 against FinanceBench, that cites the exact page every answer comes from. It is built
-as a *measured* pipeline: every component is a swappable ablation, and a CI gate
-re-runs an offline retrieval eval on each PR and fails the build on regression.
+as a *measured* pipeline: every component is a swappable ablation, a CI gate re-runs an
+offline retrieval eval on each PR and fails the build on regression, and a second,
+LLM-judged tier grades whether the generated answers are actually **correct** and
+**grounded** — FinanceBench-style.
+
+Evaluation quality is the point of the project, so every feature has to justify itself
+with a measured delta. Several features below are built, measured, and *deliberately not
+adopted* — the honest result of a fair comparison is a result.
 
 ## Architecture
 
@@ -24,7 +30,7 @@ flowchart TB
 
   subgraph ci["Eval & CI gate — per PR, fully offline"]
     direction LR
-    GD["Golden set · 30 Q"] --> FR["FixtureRetriever · committed vectors, in-process Qdrant"] --> MT["Page-level metrics"] --> GT{"recall@10 / ndcg@10 vs baseline"}
+    GD["Golden set · 30 Q"] --> FR["FixtureRetriever · committed vectors, in-process Qdrant"] --> MT["Page-level metrics"] --> GT{"recall@10 / ndcg@10 / recall@50 vs baseline"}
     GT -->|regressed| RED["build fails"]
     GT -->|ok or better| GRN["build passes"]
   end
@@ -33,11 +39,25 @@ flowchart TB
   Q -. "make fixture" .-> FR
 ```
 
-Retrieval is scored on **(doc_id, page)** keys (page numbers are stable across
+The diagram shows the **adopted** pipeline (PyMuPDF dense). An optional table-aware
+**Docling** parser and the **LLM-judged** Tier 2 (below) layer on top but are not the
+default. Retrieval is scored on **(doc_id, page)** keys (page numbers are stable across
 chunkers), so strategies stay comparable across ablations and a right-page/wrong-filing
 match never counts as a hit.
 
-## Baseline
+## Two-tier evaluation
+
+- **Tier 1 — retrieval, deterministic, fully offline.** Scores *which pages came back*,
+  not what any model wrote: no network, no GPU, no API key. This is the tier the **CI
+  gate** runs on every PR (even from forks). Same config in → byte-identical results file
+  out.
+- **Tier 2 — answer quality, LLM-judged.** Grades the *generated answers*: correctness,
+  faithfulness, refusal rate, and citation validity. It costs API quota, so it is **off by
+  default and never gates a build** — a quality read, not a build check. Every judgment is
+  cached **content-addressed on what was judged**, so a re-run spends nothing re-judging an
+  identical answer, and an interrupted run resumes exactly where it stopped.
+
+## Retrieval baseline (Tier 1)
 
 Dense-only retrieval, 30 questions, Gemini Flash at `temperature=0`. Metrics are the
 mean over questions, split by whether answering the question needs a figure (numeric)
@@ -51,8 +71,46 @@ or narrative (prose).
 
 **Read:** the evidence page is *found* 82% of the time (recall@50) but *ranked in the
 top 10* only 50% of the time — a ranking problem, not a finding problem. Closing that
-gap is the goal of the ablations: hybrid BM25 and cross-encoder reranking (both
-measured below).
+gap is the goal of the ablations below.
+
+## Answer quality: LLM-judged (Tier 2)
+
+The judged eval over `baseline_dense`, 30 questions. The judge is Groq's
+`openai/gpt-oss-20b` (`temperature=0`). Two judged signals plus two deterministic ones:
+
+- **Correctness** — a binary FinanceBench-style verdict (`correct`/`incorrect`) against a
+  **versioned rubric** (`config/judge/correctness_rubric.md`): numbers must match allowing
+  for rounding/unit formatting ($1,577M = $1.577B), the right figure for the *wrong*
+  period/segment is incorrect, every part of a multi-part question must be answered, and
+  any claim contradicting the gold answer is incorrect. Percent correct is over **all**
+  questions, with refusals counted as not-correct (as FinanceBench reports accuracy).
+- **Faithfulness** — Ragas, scored against the text of the chunks the answer *validly
+  cited* (not everything retrieved): is the answer grounded in the evidence it claims?
+- **Refusal** — deterministic, from the generator's own "insufficient evidence" flag; a
+  refusal is never sent to the judge and counts as not-correct.
+- **Citation validity** — deterministic (from the serving path): the fraction of cited
+  chunk-ids that were actually in the model's context — i.e. it never fabricated a cite.
+
+| Group   |  n | correct | incorrect | refused | faithfulness | citation validity |
+|:--------|---:|--------:|----------:|--------:|-------------:|------------------:|
+| Overall | 30 | **76.7%** |   13.3% |   10.0% |        0.888 |             1.000 |
+| Numeric | 16 |   81.2% |     18.8% |    0.0% |        0.838 |             1.000 |
+| Prose   | 14 |   71.4% |      7.1% |   21.4% |        0.961 |             1.000 |
+
+**Read:** citation validity is a perfect **1.00** (the generator never cites a chunk it
+wasn't given) and faithfulness is **0.89**, so answers are well-grounded in what they
+cite. Correctness is **76.7%** — higher on numeric (81%) than prose (71%), and **all
+refusals are prose**: the generator honestly abstains when dense retrieval buries the
+narrative evidence, which lines up with the weaker prose recall@10 (0.46) above. The
+headline is an *answer-level* number that sits on top of the retrieval metrics — it moves
+when either retrieval or generation improves.
+
+**Judge, verified against a human.** Because an LLM judge is only trustworthy if it
+agrees with a person, `ledgion analyze grading-sheet` exports a **blind** CSV (the judge's
+verdicts are withheld so they can't anchor the grader; refusals are pre-filled), and
+`ledgion analyze judge-agreement` joins the completed sheet back on the answer hash and
+reports agreement, a confusion matrix, and **Cohen's kappa**. The percentages above are
+the judge's; human-agreement confirmation is the next step.
 
 ## Hybrid retrieval: measured, not adopted
 
@@ -91,8 +149,7 @@ noise evicts dense evidence pages from the shared 50-slot budget, dropping recal
 the top 50, so recall is preserved exactly) trades a small recall@10 dip for a small
 early-rank gain (best: stopwords · sw0.25, nDCG@10 +0.014, hit@1 +0.067). Those gains
 are marginal and ranking-only, so hybrid ships as a documented, reproducible ablation
-rather than the default — the honest next lever is reranking. See
-[`DECISIONS.md`](DECISIONS.MD) for the full analysis.
+rather than the default. See [`DECISIONS.md`](DECISIONS.MD) for the full analysis.
 
 ## Reranking: measured, not adopted
 
@@ -131,32 +188,85 @@ cross-encoders reward prose that restates the question, while 10-K evidence is a
 table whose header does not. Both models' frozen scores are kept for re-measurement at
 corpus scale. See [`DECISIONS.md`](DECISIONS.MD) for the full analysis.
 
+## Parser (Docling): measured, not adopted
+
+Phase 8 swapped PyMuPDF for **Docling** — a layout-aware, table-detecting parser — to ask
+two questions: does a better parser help, and does making the index *table-aware* help
+further? Docling is too heavy for the laptop, so it runs **once on a Colab GPU** and emits
+an artifact; everything downstream reads that file with no Docling dependency. Three
+indexes were compared against PyMuPDF (all dense, top_k 50; recall@50 = recall@k here).
+
+| Index              | hit@1 |  MRR | nDCG@10 | recall@10 | recall@50 |
+|:-------------------|------:|-----:|--------:|----------:|----------:|
+| pymupdf (baseline) | 0.133 | 0.252 | 0.291 |    0.500 |     0.817 |
+| docling · flat     | +.067 | +.057 | **+.049** |   ±0 |     −.033 |
+| docling · markdown | +.067 | +.040 | +.044 |    +.017 | **−.150** |
+| docling · linearized | +.067 | +.039 | +.035 |  −.017 | **−.150** |
+
+**Why measured, not adopted.** The *parser* is the lever: `flat` (Docling's text, tables
+inline) lifts prose ranking markedly (prose nDCG@10 +.126, hit@1 +.143) from better
+reading-order chunks. But pulling tables out as their own chunks (`markdown`/`linearized`)
+**collapses numeric recall@50** (−.281 on numeric) — table *isolation* from its page is
+the culprit, not the cell encoding (linearizing didn't rescue it). On the adoption rule
+nothing clears the bar (each fails the recall@50 no-regression guard), so the default
+stays PyMuPDF dense. The surprising, interview-worthy finding: **the parser helps,
+table-awareness hurts** — the opposite of the pre-registered hypothesis. See
+[`DECISIONS.md`](DECISIONS.MD).
+
+## Adoption rule
+
+A configuration replaces the default only if, on the Tier-1 overall metrics, it (1) does
+**not regress** recall@10, nDCG@10, or recall@50 by more than 0.02, **and** (2) **improves**
+recall@10 or nDCG@10 by more than 0.02. `ledgion analyze adoption` applies this to every
+results file and names the winner — currently **none**: hybrid, reranking, and Docling are
+all built and measured, and the default stays **PyMuPDF dense**. An honest "no change" from
+a fair test is the deliverable, not a feature count.
+
 ## CI gate
 
 Every PR runs `ledgion eval --tier 1 --gate` on a stock runner — no GPU, no network,
 no API keys, no model download (so it works on fork PRs too). It scores retrieval
-against committed fixtures and **fails the build if recall@10 or nDCG@10 falls more
-than 0.02 below the recorded baseline.** Improvements always pass.
+against committed fixtures and **fails the build if recall@10, nDCG@10, or recall@50 falls
+more than 0.02 below the recorded baseline.** Improvements always pass.
 
 A PR that sets `retrieval.top_k: 1` — the gate catches the regression and fails:
 
-![CI gate failing on a regression](screenshots/testPR_1.PNG)
+![CI gate failing on a regression](ledgion/testPR_1.PNG)
 
 Reverting `top_k` back to 50 — the gate passes and the PR is mergeable:
 
-![CI gate passing after the fix](screenshots/testPR_2.PNG)
+![CI gate passing after the fix](ledgion/testPR_2.PNG)
 
 ## Limitations
 
-- **Corpus:** 5 filings of FinanceBench's 84 (AMD, Amex, Boeing, PepsiCo, Amcor 10-Ks).
-- **Golden set:** 30 questions of FinanceBench's 150.
-- **No table-aware parsing:** PyMuPDF extracts plain text; financial tables lose
-  structure. Table-aware parsing (Docling) is a planned ablation, not yet included.
-- **Faithfulness is measured by citation validation, not an LLM judge:** answers are
-  checked deterministically against the pages actually sent to the model; the judged
-  (Ragas) tier is off by default and never gates the build.
+- **Corpus:** 5 filings of FinanceBench's 84 (AMD, Amex, Boeing, PepsiCo, Amcor 10-Ks);
+  golden set of 30 questions of FinanceBench's 150. Treat percentages as directional at
+  this sample size.
+- **Default is plain-text parsing:** PyMuPDF extracts text without table structure.
+  Table-aware parsing (Docling) is built and measured (above) but not adopted — it helped
+  prose ranking and hurt numeric recall.
+- **Tier 2 is a single-judge read:** one judge model
+  (gpt-oss-20b), off by default, never gates the build. The blind grading-sheet and
+  judge-agreement (Cohen's kappa) tooling is provided to validate it against a human.
+- **Tier 2 is scored on the dense baseline only so far:** adding a *judged* column to the
+  other retrieval ablations is the natural next step.
 
 ## Commands
 
-See the `Makefile`: `make ingest`, `make eval` (live), `make fixture` (regenerate the
-offline fixtures), `make test`, `make lint`.
+See the `Makefile` for the common targets:
+
+- `make ingest` — parse, chunk, embed the filings into Qdrant.
+- `make eval` — run the live Tier-1 retrieval eval.
+- `make fixture` — regenerate the committed offline fixtures the CI gate replays.
+- `make test`, `make lint`.
+
+Other commands:
+
+- **Ask a question:** `uv run ledgion ask "What were Amcor's FY2023 net sales?"`
+- **CI gate locally:** `uv run ledgion eval --tier 1 --gate`
+- **Ablation table:** `uv run ledgion eval --compare results/<a>.json results/<b>.json …`
+- **Tier 2 (judged, off by default):** `uv run ledgion eval --tier 2` — needs
+  `GROQ_API_KEY` and the optional judge dependencies (`uv sync --group tier2`).
+- **Hand-grading:** `uv run ledgion analyze grading-sheet <results>.json --out sheet.csv`,
+  then after grading, `uv run ledgion analyze judge-agreement <results>.json --sheet sheet.csv`.
+- **Adoption verdict:** `uv run ledgion analyze adoption`

@@ -85,6 +85,27 @@ dev = [
 models = [
     "sentence-transformers>=6.0.1",
 ]
+# Tier 2 (judged eval) only. Ragas + an OpenAI-compatible client for the Groq judge.
+# NOT in default-groups and NOT installed by CI: Tier 2 never gates the build and
+# never runs on a runner, so the offline Tier-1 gate (`uv sync --no-group models`)
+# stays judge-free. Unlike docling, ragas 0.4.3 pins `typer` with NO upper bound, so
+# it resolves cleanly alongside this project's typer>=0.27.2 and does not make the
+# shared lock unsatisfiable. Pinned exactly (==) because ragas's LLM-integration API
+# has changed between releases and the judge wiring targets this one. openai is listed
+# explicitly (not just via ragas) because the correctness judge calls it directly.
+tier2 = [
+    "ragas==0.4.3",
+    "openai>=1.0.0",
+    # ragas 0.4.3 has NO upper bound on the langchain packages, but its code predates
+    # langchain 1.0: `ragas/llms/base.py` does `from langchain_community.chat_models.vertexai
+    # import ChatVertexAI`, a module removed in the 1.0 cleanup — so with the latest
+    # langchain `import ragas` fails outright. Hold the whole ecosystem on the pre-1.0
+    # (0.3.x) line it was built against. Pinning langchain-core cascades to the rest.
+    "langchain-core<1.0",
+    "langchain<1.0",
+    "langchain-community<0.4",
+    "langchain-openai<1.0",
+]
 # Docling (Phase 8 parser ablation) is intentionally NOT a uv dependency or group. It
 # runs ONLY on Colab (notebooks/colab_docling_parse.ipynb, via `pip install
 # docling==2.130.0`) and never in the local or CI env. It cannot be a uv group:
