@@ -504,6 +504,8 @@ faithfulness .89 say answers are well-grounded in what they cite; correctness
 are prose (the generator abstains when dense retrieval buries the evidence, which
 matches Tier-1's weaker prose recall@10 .46). Faithfulness numeric .84 < prose .96:
 numeric answers lean on tables where ragas's claim-by-claim NLI is stricter.
-NOTE: judged numbers pending human-grading confirmation — grading sheet exported
-to grading_baseline_dense.csv (27 to grade, 3 refusals pre-filled, no judge
-verdicts); run `ledgion analyze judge-agreement` after grading for kappa.
+HUMAN-CONFIRMED: blind grading of all 27 non-refusal answers
+(grading_baseline_dense.csv) agrees with the judge on every one — 23 correct,
+4 incorrect, 0 disagreements → agreement po 1.00, Cohen's kappa 1.00. The judge
+faithfully applies the rubric; 76.7% is the judge's AND the human's number.
+Small sample (27), so directional, but as clean as this check gets.
