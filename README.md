@@ -109,8 +109,10 @@ when either retrieval or generation improves.
 agrees with a person, `ledgion analyze grading-sheet` exports a **blind** CSV (the judge's
 verdicts are withheld so they can't anchor the grader; refusals are pre-filled), and
 `ledgion analyze judge-agreement` joins the completed sheet back on the answer hash and
-reports agreement, a confusion matrix, and **Cohen's kappa**. The percentages above are
-the judge's; human-agreement confirmation is the next step.
+reports agreement, a confusion matrix, and **Cohen's kappa**. Blind human grading of all
+27 non-refusal answers agrees with the judge on **every one** — 23 correct, 4 incorrect,
+**zero disagreements** — so **Cohen's kappa = 1.00**. The 76.7% correctness above is the
+judge's number *and* the human's; the judge faithfully applies the rubric.
 
 ## Hybrid retrieval: measured, not adopted
 
@@ -246,8 +248,9 @@ Reverting `top_k` back to 50 — the gate passes and the PR is mergeable:
   Table-aware parsing (Docling) is built and measured (above) but not adopted — it helped
   prose ranking and hurt numeric recall.
 - **Tier 2 is a single-judge read:** one judge model
-  (gpt-oss-20b), off by default, never gates the build. The blind grading-sheet and
-  judge-agreement (Cohen's kappa) tooling is provided to validate it against a human.
+  (gpt-oss-20b), off by default, never gates the build. It is validated against a blind
+  human grading (Cohen's kappa = 1.00 over 27 answers), though at that sample size the
+  check is directional.
 - **Tier 2 is scored on the dense baseline only so far:** adding a *judged* column to the
   other retrieval ablations is the natural next step.
 
